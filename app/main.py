@@ -1,7 +1,7 @@
-import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +27,7 @@ from app.services import (
     status_catalog,
 )
 
+logger = logging.getLogger(__name__)
 app = FastAPI(title=settings.app_name, version="0.1.0")
 static_dir = Path(__file__).resolve().parent / "static"
 
@@ -41,10 +42,29 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    logging.basicConfig(level=logging.INFO)
     init_db()
-    if settings.bot_token:
-        from app.bot import run_bot
-        asyncio.create_task(run_bot())
+    if settings.bot_token and settings.webapp_url:
+        from aiogram.types import Update
+        from app.bot import get_bot, get_dispatcher
+        bot = get_bot()
+        webhook_url = f"{settings.webapp_url}/webhook"
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to {webhook_url}")
+        await bot.session.close()
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request) -> dict:
+    from aiogram.types import Update
+    from app.bot import get_bot, get_dispatcher
+    bot = get_bot()
+    dp = get_dispatcher()
+    data = await request.json()
+    update = Update.model_validate(data)
+    await dp.feed_update(bot, update)
+    await bot.session.close()
+    return {"ok": True}
 
 @app.get("/health")
 def health_check() -> dict[str, str]:

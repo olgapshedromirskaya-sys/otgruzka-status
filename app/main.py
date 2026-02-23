@@ -1,12 +1,11 @@
+import asyncio
 from pathlib import Path
 from typing import Optional
-
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-
 from app.config import settings
 from app.db import get_session, init_db
 from app.enums import Marketplace, OrderStatus
@@ -37,39 +36,36 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-
 @app.on_event("startup")
-def startup_event() -> None:
+async def startup_event() -> None:
     init_db()
-
+    if settings.bot_token:
+        from app.bot import run_bot
+        asyncio.create_task(run_bot())
 
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
-
 @app.get("/")
 def serve_web_app() -> FileResponse:
     return FileResponse(static_dir / "index.html")
-
 
 @app.get("/api/meta/statuses", response_model=list[StatusCatalogItem])
 def get_statuses() -> list[StatusCatalogItem]:
     return status_catalog()
 
-
 @app.get("/api/meta/marketplaces")
 def get_marketplaces() -> list[dict[str, str]]:
     return marketplace_catalog()
-
 
 @app.post("/api/orders", response_model=OrderRead, status_code=201)
 def create_order_endpoint(payload: OrderCreate, session: Session = Depends(get_session)) -> OrderRead:
     order = create_order(session, payload)
     return get_order_or_404(session, order.id)
-
 
 @app.get("/api/orders", response_model=OrdersResponse)
 def list_orders_endpoint(
@@ -90,14 +86,12 @@ def list_orders_endpoint(
     )
     return OrdersResponse(items=items, total=total)
 
-
 @app.get("/api/orders/{order_id}", response_model=OrderRead)
 def get_order_endpoint(order_id: int, session: Session = Depends(get_session)) -> OrderRead:
     try:
         return get_order_or_404(session, order_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
 
 @app.post("/api/orders/{order_id}/events", response_model=OrderRead)
 def add_event_endpoint(
@@ -111,15 +105,12 @@ def add_event_endpoint(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return add_order_event(session, order, payload)
 
-
 @app.get("/api/dashboard/{marketplace}", response_model=DashboardSummary)
 def dashboard_marketplace_endpoint(
     marketplace: Marketplace, session: Session = Depends(get_session)
 ) -> DashboardSummary:
     return build_summary(session, marketplace)
 
-
 @app.get("/api/dashboard")
 def dashboard_all_endpoint(session: Session = Depends(get_session)) -> list[DashboardSummary]:
     return [build_summary(session, marketplace) for marketplace in Marketplace]
-

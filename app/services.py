@@ -1,18 +1,125 @@
-from datetime import datetime, timezone
-from typing import Optional
+import asyncio
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
 
+import httpx
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.enums import FINAL_STATUSES, MARKETPLACE_LABELS, STATUS_LABELS, Marketplace, OrderStatus
-from app.models import Order, OrderEvent
-from app.schemas import DashboardSummary, OrderCreate, OrderEventCreate
+from app.config import settings as app_settings
+from app.db import session_scope
+from app.enums import MARKETPLACE_LABELS, STATUS_LABELS, Marketplace, OrderStatus
+from app.models import Order, OrderEvent, Settings
+from app.schemas import (
+    DashboardSummary,
+    OrderBrief,
+    OrderEventRead,
+    OrderRead,
+    SettingsRead,
+    SettingsUpdate,
+    SyncReport,
+    TodaySummary,
+)
+
+logger = logging.getLogger(__name__)
+
+SYNC_LOCK = asyncio.Lock()
+REQUEST_PAUSE_SECONDS = 0.45
+MAX_WB_PAGES = 20
+MAX_OZON_PAGES = 30
+
+WB_ORDERS_URL = "https://api.wildberries.ru/api/v3/orders"
+OZON_FBS_LIST_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
 
 
-RETURN_STATUSES = {
-    OrderStatus.RETURN_STARTED,
-    OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER,
-    OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP,
+@dataclass(slots=True)
+class ExternalOrderSnapshot:
+    marketplace: Marketplace
+    assembly_task_number: str
+    status: OrderStatus
+    status_at: datetime
+    product_name: str
+    sku: str | None
+    quantity: int
+    due_ship_at: datetime | None
+    source_status: str
+
+
+WB_STATUS_INT_MAP: dict[int, OrderStatus] = {
+    0: OrderStatus.NEW,
+    1: OrderStatus.ASSEMBLY,
+    2: OrderStatus.TRANSFERRED_TO_DELIVERY,
+    3: OrderStatus.ACCEPTED_AT_WAREHOUSE,
+    4: OrderStatus.IN_TRANSIT_TO_BUYER,
+    5: OrderStatus.ARRIVED_AT_BUYER_PICKUP,
+    6: OrderStatus.BUYOUT,
+    7: OrderStatus.RETURN_STARTED,
+    8: OrderStatus.REJECTION,
+    9: OrderStatus.DEFECT,
+    10: OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER,
+    11: OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP,
+    12: OrderStatus.SELLER_PICKED_UP,
+}
+
+WB_STATUS_TEXT_MAP: dict[str, OrderStatus] = {
+    "new": OrderStatus.NEW,
+    "created": OrderStatus.NEW,
+    "confirm": OrderStatus.NEW,
+    "awaiting_confirm": OrderStatus.NEW,
+    "assembly": OrderStatus.ASSEMBLY,
+    "assembling": OrderStatus.ASSEMBLY,
+    "awaiting_packaging": OrderStatus.ASSEMBLY,
+    "pack": OrderStatus.ASSEMBLY,
+    "packed": OrderStatus.ASSEMBLY,
+    "transferred_to_delivery": OrderStatus.TRANSFERRED_TO_DELIVERY,
+    "to_delivery": OrderStatus.TRANSFERRED_TO_DELIVERY,
+    "awaiting_deliver": OrderStatus.TRANSFERRED_TO_DELIVERY,
+    "accepted_at_warehouse": OrderStatus.ACCEPTED_AT_WAREHOUSE,
+    "accepted": OrderStatus.ACCEPTED_AT_WAREHOUSE,
+    "in_transit_to_buyer": OrderStatus.IN_TRANSIT_TO_BUYER,
+    "delivering": OrderStatus.IN_TRANSIT_TO_BUYER,
+    "in_transit": OrderStatus.IN_TRANSIT_TO_BUYER,
+    "arrived_at_pickup_point": OrderStatus.ARRIVED_AT_BUYER_PICKUP,
+    "arrived_at_buyer_pickup": OrderStatus.ARRIVED_AT_BUYER_PICKUP,
+    "ready_for_pickup": OrderStatus.ARRIVED_AT_BUYER_PICKUP,
+    "buyout": OrderStatus.BUYOUT,
+    "purchased": OrderStatus.BUYOUT,
+    "picked_up": OrderStatus.BUYOUT,
+    "return": OrderStatus.RETURN_STARTED,
+    "return_started": OrderStatus.RETURN_STARTED,
+    "cancelled": OrderStatus.REJECTION,
+    "canceled": OrderStatus.REJECTION,
+    "rejected": OrderStatus.REJECTION,
+    "defect": OrderStatus.DEFECT,
+    "broken": OrderStatus.DEFECT,
+    "return_in_transit": OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER,
+    "return_in_transit_from_buyer": OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER,
+    "return_arrived": OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP,
+    "return_arrived_to_seller_pickup": OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP,
+    "seller_picked_up": OrderStatus.SELLER_PICKED_UP,
+}
+
+OZON_STATUS_MAP: dict[str, OrderStatus] = {
+    "awaiting_registration": OrderStatus.NEW,
+    "acceptance_in_progress": OrderStatus.NEW,
+    "awaiting_approve": OrderStatus.NEW,
+    "awaiting_packaging": OrderStatus.ASSEMBLY,
+    "awaiting_deliver": OrderStatus.TRANSFERRED_TO_DELIVERY,
+    "driver_pickup": OrderStatus.TRANSFERRED_TO_DELIVERY,
+    "sent_by_seller": OrderStatus.TRANSFERRED_TO_DELIVERY,
+    "not_accepted": OrderStatus.REJECTION,
+    "cancelled": OrderStatus.REJECTION,
+    "delivering": OrderStatus.IN_TRANSIT_TO_BUYER,
+    "delivered": OrderStatus.ARRIVED_AT_BUYER_PICKUP,
+    "received": OrderStatus.BUYOUT,
+    "returned": OrderStatus.RETURN_STARTED,
+    "returning": OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER,
+    "returned_to_seller": OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP,
+    "seller_pickup": OrderStatus.SELLER_PICKED_UP,
+    "loss": OrderStatus.DEFECT,
 }
 
 
@@ -22,76 +129,179 @@ def _to_aware_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def create_order(session: Session, payload: OrderCreate) -> Order:
-    status_at = _to_aware_utc(payload.initial_status_at or datetime.now(timezone.utc))
-    due_ship_at = _to_aware_utc(payload.due_ship_at) if payload.due_ship_at else None
+def _parse_datetime(value: Any, fallback: datetime | None = None) -> datetime:
+    if isinstance(value, datetime):
+        return _to_aware_utc(value)
+    if value is None:
+        return fallback or datetime.now(timezone.utc)
+    text = str(value).strip()
+    if not text:
+        return fallback or datetime.now(timezone.utc)
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        return _to_aware_utc(parsed)
+    except ValueError:
+        pass
 
-    order = Order(
-        marketplace=payload.marketplace,
-        external_order_id=payload.external_order_id,
-        product_name=payload.product_name,
-        sku=payload.sku,
-        quantity=payload.quantity,
-        due_ship_at=due_ship_at,
-        current_status=payload.initial_status,
-        current_status_at=status_at,
-        comment=payload.comment,
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            return parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return fallback or datetime.now(timezone.utc)
+
+
+def _safe_int(value: Any, default: int = 1) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_status_text(raw_status: str | int | None) -> str:
+    if raw_status is None:
+        return ""
+    return str(raw_status).strip().lower()
+
+
+def _map_wb_status(raw_status: str | int | None) -> OrderStatus:
+    if isinstance(raw_status, int):
+        return WB_STATUS_INT_MAP.get(raw_status, OrderStatus.NEW)
+
+    normalized = _normalize_status_text(raw_status)
+    if normalized.isdigit():
+        return WB_STATUS_INT_MAP.get(int(normalized), OrderStatus.NEW)
+    if normalized in WB_STATUS_TEXT_MAP:
+        return WB_STATUS_TEXT_MAP[normalized]
+    if "cancel" in normalized or "reject" in normalized:
+        return OrderStatus.REJECTION
+    if "return" in normalized and "transit" in normalized:
+        return OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER
+    if "return" in normalized:
+        return OrderStatus.RETURN_STARTED
+    if "delivery" in normalized or "transit" in normalized:
+        return OrderStatus.IN_TRANSIT_TO_BUYER
+    if "warehouse" in normalized:
+        return OrderStatus.ACCEPTED_AT_WAREHOUSE
+    if "pickup" in normalized:
+        return OrderStatus.ARRIVED_AT_BUYER_PICKUP
+    return OrderStatus.NEW
+
+
+def _map_ozon_status(raw_status: str | int | None) -> OrderStatus:
+    normalized = _normalize_status_text(raw_status)
+    if normalized in OZON_STATUS_MAP:
+        return OZON_STATUS_MAP[normalized]
+    if "cancel" in normalized or "not_accepted" in normalized:
+        return OrderStatus.REJECTION
+    if "return" in normalized and "to_seller" in normalized:
+        return OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP
+    if "return" in normalized:
+        return OrderStatus.RETURN_STARTED
+    if "deliver" in normalized or "transit" in normalized:
+        return OrderStatus.IN_TRANSIT_TO_BUYER
+    return OrderStatus.NEW
+
+
+def _today_start_utc() -> datetime:
+    try:
+        tz = ZoneInfo(app_settings.timezone)
+    except Exception:
+        tz = timezone.utc
+    now_local = datetime.now(tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc)
+
+
+def _event_note(source_status: str) -> str:
+    normalized = source_status.strip()
+    if not normalized:
+        return "Синхронизация API"
+    return f"Синхронизация API ({normalized})"
+
+
+def _event_to_read(event: OrderEvent) -> OrderEventRead:
+    return OrderEventRead(
+        id=event.id,
+        status=event.status,
+        status_name=STATUS_LABELS[event.status],
+        event_at=_to_aware_utc(event.event_at),
+        note=event.note,
     )
-    order.events.append(
-        OrderEvent(
-            status=payload.initial_status,
-            event_at=status_at,
-            note="Первичный статус заказа",
-        )
+
+
+def _order_to_read(order: Order) -> OrderRead:
+    events = sorted(order.events, key=lambda item: item.event_at, reverse=True)
+    return OrderRead(
+        id=order.id,
+        marketplace=order.marketplace,
+        marketplace_name=MARKETPLACE_LABELS[order.marketplace],
+        assembly_task_number=order.external_order_id,
+        product_name=order.product_name,
+        sku=order.sku,
+        quantity=order.quantity,
+        current_status=order.current_status,
+        current_status_name=STATUS_LABELS[order.current_status],
+        current_status_at=_to_aware_utc(order.current_status_at),
+        created_at=_to_aware_utc(order.created_at),
+        updated_at=_to_aware_utc(order.updated_at),
+        events=[_event_to_read(event) for event in events],
     )
-    session.add(order)
+
+
+def status_catalog() -> list[dict[str, str]]:
+    return [{"code": status.value, "name": STATUS_LABELS[status]} for status in OrderStatus]
+
+
+def marketplace_catalog() -> list[dict[str, str]]:
+    return [{"code": market.value, "name": MARKETPLACE_LABELS[market]} for market in Marketplace]
+
+
+def _get_or_create_settings(session: Session) -> Settings:
+    settings_entity = session.get(Settings, 1)
+    if settings_entity:
+        return settings_entity
+    settings_entity = Settings(id=1, wb_token="", ozon_client_id="", ozon_api_key="")
+    session.add(settings_entity)
+    session.flush()
+    return settings_entity
+
+
+def get_settings(session: Session) -> SettingsRead:
+    settings_entity = _get_or_create_settings(session)
+    return SettingsRead(
+        wb_token=settings_entity.wb_token or "",
+        ozon_client_id=settings_entity.ozon_client_id or "",
+        ozon_api_key=settings_entity.ozon_api_key or "",
+        updated_at=settings_entity.updated_at,
+    )
+
+
+def save_settings(session: Session, payload: SettingsUpdate) -> SettingsRead:
+    settings_entity = _get_or_create_settings(session)
+    settings_entity.wb_token = payload.wb_token.strip()
+    settings_entity.ozon_client_id = payload.ozon_client_id.strip()
+    settings_entity.ozon_api_key = payload.ozon_api_key.strip()
+    session.add(settings_entity)
     session.commit()
-    session.refresh(order)
-    return order
-
-
-def get_order_or_404(session: Session, order_id: int) -> Order:
-    query = (
-        select(Order)
-        .where(Order.id == order_id)
-        .options(selectinload(Order.events))
-    )
-    order = session.scalar(query)
-    if not order:
-        raise ValueError(f"Order {order_id} not found")
-    return order
-
-
-def add_order_event(session: Session, order: Order, payload: OrderEventCreate) -> Order:
-    event_at = _to_aware_utc(payload.event_at)
-    event = OrderEvent(
-        order_id=order.id,
-        status=payload.status,
-        event_at=event_at,
-        note=payload.note,
-    )
-    session.add(event)
-    order.current_status = payload.status
-    order.current_status_at = event_at
-    session.add(order)
-    session.commit()
-    session.refresh(order)
-    return get_order_or_404(session, order.id)
+    session.refresh(settings_entity)
+    return get_settings(session)
 
 
 def list_orders(
     session: Session,
-    marketplace: Optional[Marketplace] = None,
-    status: Optional[OrderStatus] = None,
-    search: Optional[str] = None,
-    limit: int = 100,
+    marketplace: Marketplace | None = None,
+    search: str | None = None,
+    limit: int = 200,
     offset: int = 0,
-) -> tuple[list[Order], int]:
+) -> tuple[list[OrderRead], int]:
     filters = []
     if marketplace:
         filters.append(Order.marketplace == marketplace)
-    if status:
-        filters.append(Order.current_status == status)
     if search:
         needle = f"%{search.strip()}%"
         filters.append(
@@ -108,104 +318,449 @@ def list_orders(
         base_query = base_query.where(and_(*filters))
         count_query = count_query.where(and_(*filters))
 
-    base_query = base_query.order_by(Order.current_status_at.desc()).limit(limit).offset(offset)
+    base_query = base_query.order_by(Order.current_status_at.desc(), Order.id.desc()).limit(limit).offset(offset)
     items = list(session.scalars(base_query).all())
-    total = session.scalar(count_query) or 0
-    return items, total
+    total = int(session.scalar(count_query) or 0)
+    return ([_order_to_read(item) for item in items], total)
+
+
+def list_recent_orders(session: Session, marketplace: Marketplace, limit: int = 10) -> list[OrderBrief]:
+    query = (
+        select(Order)
+        .where(Order.marketplace == marketplace)
+        .order_by(Order.current_status_at.desc(), Order.id.desc())
+        .limit(limit)
+    )
+    items = list(session.scalars(query).all())
+    return [
+        OrderBrief(
+            assembly_task_number=item.external_order_id,
+            current_status=item.current_status,
+            current_status_name=STATUS_LABELS[item.current_status],
+            current_status_at=_to_aware_utc(item.current_status_at),
+        )
+        for item in items
+    ]
 
 
 def build_summary(session: Session, marketplace: Marketplace) -> DashboardSummary:
-    now = datetime.now(timezone.utc)
-    marketplace_filter = Order.marketplace == marketplace
-
-    total_orders = session.scalar(select(func.count(Order.id)).where(marketplace_filter)) or 0
-    active_orders = (
+    today_start = _today_start_utc()
+    market_filter = Order.marketplace == marketplace
+    total_orders = int(session.scalar(select(func.count(Order.id)).where(market_filter)) or 0)
+    updated_today = int(
         session.scalar(
             select(func.count(Order.id)).where(
-                marketplace_filter,
-                Order.current_status.not_in(FINAL_STATUSES),
+                market_filter,
+                Order.current_status_at >= today_start,
             )
         )
         or 0
     )
-    overdue_to_ship = (
-        session.scalar(
-            select(func.count(Order.id)).where(
-                marketplace_filter,
-                Order.due_ship_at.is_not(None),
-                Order.due_ship_at < now,
-                Order.current_status.not_in(FINAL_STATUSES),
-            )
+    grouped = (
+        session.execute(
+            select(Order.current_status, func.count(Order.id))
+            .where(market_filter)
+            .group_by(Order.current_status)
         )
-        or 0
+        .all()
     )
 
-    buyout_count = (
-        session.scalar(
-            select(func.count(Order.id)).where(
-                marketplace_filter, Order.current_status == OrderStatus.BUYOUT
-            )
-        )
-        or 0
-    )
-    rejection_count = (
-        session.scalar(
-            select(func.count(Order.id)).where(
-                marketplace_filter, Order.current_status == OrderStatus.REJECTION
-            )
-        )
-        or 0
-    )
-    return_count = (
-        session.scalar(
-            select(func.count(Order.id)).where(
-                marketplace_filter, Order.current_status.in_(RETURN_STATUSES)
-            )
-        )
-        or 0
-    )
-    defect_count = (
-        session.scalar(
-            select(func.count(Order.id)).where(
-                marketplace_filter, Order.current_status == OrderStatus.DEFECT
-            )
-        )
-        or 0
-    )
-
-    grouped = session.execute(
-        select(Order.current_status, func.count(Order.id))
-        .where(marketplace_filter)
-        .group_by(Order.current_status)
-    ).all()
-
-    by_status: dict[str, int] = {}
+    by_status: dict[str, int] = {STATUS_LABELS[status]: 0 for status in OrderStatus}
     for status, count in grouped:
-        by_status[status.value] = count
-    for status in OrderStatus:
-        by_status.setdefault(status.value, 0)
-
-    denominator = buyout_count + rejection_count
-    buyout_rate = (buyout_count / denominator * 100.0) if denominator else 0.0
+        by_status[STATUS_LABELS[status]] = int(count)
 
     return DashboardSummary(
         marketplace=marketplace,
+        marketplace_name=MARKETPLACE_LABELS[marketplace],
         total_orders=total_orders,
-        active_orders=active_orders,
-        overdue_to_ship=overdue_to_ship,
-        buyout_count=buyout_count,
-        rejection_count=rejection_count,
-        return_count=return_count,
-        defect_count=defect_count,
-        buyout_rate_percent=round(buyout_rate, 1),
+        updated_today=updated_today,
         by_status=by_status,
     )
 
 
-def status_catalog() -> list[dict[str, str]]:
-    return [{"code": status.value, "name": STATUS_LABELS[status]} for status in OrderStatus]
+def build_today_summary(session: Session) -> TodaySummary:
+    today_start = _today_start_utc()
+    wb_updates = int(
+        session.scalar(
+            select(func.count(Order.id)).where(
+                Order.marketplace == Marketplace.WB,
+                Order.current_status_at >= today_start,
+            )
+        )
+        or 0
+    )
+    ozon_updates = int(
+        session.scalar(
+            select(func.count(Order.id)).where(
+                Order.marketplace == Marketplace.OZON,
+                Order.current_status_at >= today_start,
+            )
+        )
+        or 0
+    )
+
+    return TodaySummary(
+        date=today_start.date().isoformat(),
+        wb_updates=wb_updates,
+        ozon_updates=ozon_updates,
+        total_updates=wb_updates + ozon_updates,
+    )
 
 
-def marketplace_catalog() -> list[dict[str, str]]:
-    return [{"code": market.value, "name": MARKETPLACE_LABELS[market]} for market in Marketplace]
+def export_rows(session: Session) -> list[dict[str, str]]:
+    query = select(Order).options(selectinload(Order.events)).order_by(Order.marketplace, Order.current_status_at.desc())
+    orders = list(session.scalars(query).all())
+    rows: list[dict[str, str]] = []
+    for order in orders:
+        events = sorted(order.events, key=lambda item: item.event_at)
+        history = " | ".join(
+            f"{STATUS_LABELS[event.status]} ({_to_aware_utc(event.event_at).strftime('%d.%m.%Y %H:%M')})"
+            for event in events
+        )
+        rows.append(
+            {
+                "Маркетплейс": MARKETPLACE_LABELS[order.marketplace],
+                "Номер сборочного задания": order.external_order_id,
+                "Текущий статус": STATUS_LABELS[order.current_status],
+                "Дата текущего статуса": _to_aware_utc(order.current_status_at).strftime("%d.%m.%Y %H:%M"),
+                "История статусов": history,
+            }
+        )
+    return rows
+
+
+def _extract_wb_task_number(item: dict[str, Any]) -> str:
+    return str(
+        item.get("id")
+        or item.get("orderId")
+        or item.get("order_id")
+        or item.get("rid")
+        or item.get("srid")
+        or ""
+    ).strip()
+
+
+def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
+    task_number = _extract_wb_task_number(item)
+    if not task_number:
+        return None
+
+    raw_status = item.get("supplierStatus") or item.get("status") or item.get("wbStatus")
+    status = _map_wb_status(raw_status)
+    status_at = _parse_datetime(
+        item.get("updatedAt")
+        or item.get("statusUpdatedAt")
+        or item.get("createdAt")
+    )
+    due_ship_at = _parse_datetime(item.get("deadline") or item.get("shipmentDate"), fallback=status_at)
+
+    skus = item.get("skus")
+    sku = None
+    if isinstance(skus, list) and skus:
+        sku = str(skus[0])
+    elif item.get("supplierArticle"):
+        sku = str(item.get("supplierArticle"))
+    elif item.get("chrtId"):
+        sku = str(item.get("chrtId"))
+
+    product_name = (
+        str(item.get("subject") or item.get("nmName") or item.get("article") or "").strip()
+        or f"Заказ WB {task_number}"
+    )
+
+    return ExternalOrderSnapshot(
+        marketplace=Marketplace.WB,
+        assembly_task_number=task_number[:128],
+        status=status,
+        status_at=status_at,
+        product_name=product_name[:256],
+        sku=sku[:128] if sku else None,
+        quantity=_safe_int(item.get("quantity"), default=1),
+        due_ship_at=due_ship_at,
+        source_status=str(raw_status or ""),
+    )
+
+
+def _normalize_ozon_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
+    task_number = str(item.get("posting_number") or item.get("order_number") or item.get("order_id") or "").strip()
+    if not task_number:
+        return None
+
+    raw_status = item.get("status")
+    status = _map_ozon_status(raw_status)
+    status_at = _parse_datetime(
+        item.get("in_process_at")
+        or item.get("status_updated_at")
+        or item.get("created_at")
+    )
+    due_ship_at = _parse_datetime(item.get("shipment_date"), fallback=status_at)
+
+    products = item.get("products") if isinstance(item.get("products"), list) else []
+    if products:
+        first_product = products[0]
+        product_name = str(first_product.get("name") or f"Отправление Ozon {task_number}")
+        sku = str(first_product.get("offer_id") or first_product.get("sku") or "") or None
+        quantity = sum(_safe_int(product.get("quantity"), default=1) for product in products)
+    else:
+        product_name = f"Отправление Ozon {task_number}"
+        sku = None
+        quantity = 1
+
+    return ExternalOrderSnapshot(
+        marketplace=Marketplace.OZON,
+        assembly_task_number=task_number[:128],
+        status=status,
+        status_at=status_at,
+        product_name=product_name[:256],
+        sku=sku[:128] if sku else None,
+        quantity=max(quantity, 1),
+        due_ship_at=due_ship_at,
+        source_status=str(raw_status or ""),
+    )
+
+
+async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
+    headers = {"Authorization": wb_token.strip()}
+    snapshots: list[ExternalOrderSnapshot] = []
+    next_cursor: int | str | None = 0
+    now = datetime.now(timezone.utc)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for _ in range(MAX_WB_PAGES):
+            params: dict[str, Any] = {"limit": 1000, "dateFrom": (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+            if next_cursor:
+                params["next"] = next_cursor
+
+            response = await client.get(WB_ORDERS_URL, headers=headers, params=params)
+            if response.status_code == 429:
+                logger.warning("WB API вернул 429, ожидание перед повтором страницы")
+                await asyncio.sleep(2.0)
+                continue
+            response.raise_for_status()
+
+            payload = response.json()
+            orders_payload = payload.get("orders") or payload.get("data") or []
+            if isinstance(orders_payload, dict):
+                orders_payload = orders_payload.get("orders", [])
+            if not isinstance(orders_payload, list):
+                break
+
+            for item in orders_payload:
+                if isinstance(item, dict):
+                    normalized = _normalize_wb_order(item)
+                    if normalized:
+                        snapshots.append(normalized)
+
+            new_next = payload.get("next")
+            if not orders_payload or new_next in (None, "", 0) or new_next == next_cursor:
+                break
+            next_cursor = new_next
+            await asyncio.sleep(REQUEST_PAUSE_SECONDS)
+    return snapshots
+
+
+async def _fetch_ozon_orders(ozon_client_id: str, ozon_api_key: str) -> list[ExternalOrderSnapshot]:
+    headers = {
+        "Client-Id": ozon_client_id.strip(),
+        "Api-Key": ozon_api_key.strip(),
+        "Content-Type": "application/json",
+    }
+    snapshots: list[ExternalOrderSnapshot] = []
+    offset = 0
+    limit = 1000
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=30)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for _ in range(MAX_OZON_PAGES):
+            body = {
+                "dir": "DESC",
+                "filter": {
+                    "since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                "limit": limit,
+                "offset": offset,
+                "with": {
+                    "analytics_data": False,
+                    "barcodes": False,
+                    "financial_data": False,
+                    "translit": True,
+                },
+            }
+
+            response = await client.post(OZON_FBS_LIST_URL, headers=headers, json=body)
+            if response.status_code == 429:
+                logger.warning("Ozon API вернул 429, ожидание перед повтором страницы")
+                await asyncio.sleep(2.0)
+                continue
+            response.raise_for_status()
+
+            payload = response.json()
+            result = payload.get("result") or {}
+            postings = result.get("postings") or []
+            if not isinstance(postings, list):
+                break
+
+            for item in postings:
+                if isinstance(item, dict):
+                    normalized = _normalize_ozon_order(item)
+                    if normalized:
+                        snapshots.append(normalized)
+
+            has_next = bool(result.get("has_next"))
+            if not has_next or not postings:
+                break
+            offset += limit
+            await asyncio.sleep(REQUEST_PAUSE_SECONDS)
+    return snapshots
+
+
+def _collapse_snapshots(items: list[ExternalOrderSnapshot]) -> list[ExternalOrderSnapshot]:
+    collapsed: dict[tuple[Marketplace, str], ExternalOrderSnapshot] = {}
+    for item in items:
+        key = (item.marketplace, item.assembly_task_number)
+        current = collapsed.get(key)
+        if not current or item.status_at >= current.status_at:
+            collapsed[key] = item
+    return list(collapsed.values())
+
+
+def _is_duplicate_event(order: Order, status: OrderStatus, event_at: datetime) -> bool:
+    for event in order.events:
+        if event.status != status:
+            continue
+        delta = abs((_to_aware_utc(event.event_at) - event_at).total_seconds())
+        if delta < 1:
+            return True
+    return False
+
+
+def _upsert_snapshot(session: Session, snapshot: ExternalOrderSnapshot) -> tuple[bool, bool]:
+    query = (
+        select(Order)
+        .where(
+            Order.marketplace == snapshot.marketplace,
+            Order.external_order_id == snapshot.assembly_task_number,
+        )
+        .options(selectinload(Order.events))
+        .order_by(Order.id.desc())
+    )
+    order = session.scalar(query)
+    created = False
+    event_created = False
+
+    if not order:
+        order = Order(
+            marketplace=snapshot.marketplace,
+            external_order_id=snapshot.assembly_task_number,
+            product_name=snapshot.product_name,
+            sku=snapshot.sku,
+            quantity=max(snapshot.quantity, 1),
+            due_ship_at=snapshot.due_ship_at,
+            current_status=snapshot.status,
+            current_status_at=snapshot.status_at,
+            comment="Синхронизация API WB/Ozon",
+        )
+        order.events.append(
+            OrderEvent(
+                status=snapshot.status,
+                event_at=snapshot.status_at,
+                note=_event_note(snapshot.source_status),
+            )
+        )
+        session.add(order)
+        created = True
+        event_created = True
+        return created, event_created
+
+    order.product_name = snapshot.product_name or order.product_name
+    if snapshot.sku:
+        order.sku = snapshot.sku
+    order.quantity = max(snapshot.quantity, 1)
+    order.due_ship_at = snapshot.due_ship_at or order.due_ship_at
+
+    should_create_event = False
+    if order.current_status != snapshot.status:
+        should_create_event = True
+    elif snapshot.status_at > _to_aware_utc(order.current_status_at) + timedelta(seconds=1):
+        should_create_event = True
+
+    if should_create_event and not _is_duplicate_event(order, snapshot.status, snapshot.status_at):
+        order.events.append(
+            OrderEvent(
+                status=snapshot.status,
+                event_at=snapshot.status_at,
+                note=_event_note(snapshot.source_status),
+            )
+        )
+        order.current_status = snapshot.status
+        order.current_status_at = snapshot.status_at
+        event_created = True
+    elif snapshot.status_at > _to_aware_utc(order.current_status_at):
+        order.current_status_at = snapshot.status_at
+
+    session.add(order)
+    return created, event_created
+
+
+async def sync_orders_from_marketplaces() -> SyncReport:
+    if SYNC_LOCK.locked():
+        return SyncReport(
+            wb_received=0,
+            ozon_received=0,
+            processed_orders=0,
+            created_orders=0,
+            updated_orders=0,
+            created_events=0,
+            message="Синхронизация уже выполняется",
+        )
+
+    async with SYNC_LOCK:
+        with session_scope() as session:
+            cfg = get_settings(session)
+            wb_token = cfg.wb_token
+            ozon_client_id = cfg.ozon_client_id
+            ozon_api_key = cfg.ozon_api_key
+
+        wb_snapshots: list[ExternalOrderSnapshot] = []
+        ozon_snapshots: list[ExternalOrderSnapshot] = []
+
+        try:
+            if wb_token:
+                wb_snapshots = await _fetch_wb_orders(wb_token)
+                await asyncio.sleep(REQUEST_PAUSE_SECONDS)
+        except Exception:
+            logger.exception("Не удалось получить заказы WB")
+
+        try:
+            if ozon_client_id and ozon_api_key:
+                ozon_snapshots = await _fetch_ozon_orders(ozon_client_id, ozon_api_key)
+        except Exception:
+            logger.exception("Не удалось получить заказы Ozon")
+
+        all_snapshots = _collapse_snapshots([*wb_snapshots, *ozon_snapshots])
+        created_orders = 0
+        updated_orders = 0
+        created_events = 0
+
+        with session_scope() as session:
+            for snapshot in all_snapshots:
+                created, event_created = _upsert_snapshot(session, snapshot)
+                if created:
+                    created_orders += 1
+                else:
+                    updated_orders += 1
+                if event_created:
+                    created_events += 1
+
+        return SyncReport(
+            wb_received=len(wb_snapshots),
+            ozon_received=len(ozon_snapshots),
+            processed_orders=len(all_snapshots),
+            created_orders=created_orders,
+            updated_orders=updated_orders,
+            created_events=created_events,
+            message="Синхронизация завершена",
+        )
 

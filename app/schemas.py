@@ -1,54 +1,39 @@
 from datetime import datetime
-from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 from app.enums import Marketplace, OrderStatus
 
 
-class OrderEventCreate(BaseModel):
-    status: OrderStatus
-    event_at: datetime
-    note: Optional[str] = Field(default=None, max_length=2000)
-
-
-class OrderCreate(BaseModel):
-    marketplace: Marketplace
-    external_order_id: str = Field(min_length=1, max_length=128)
-    product_name: str = Field(min_length=1, max_length=256)
-    sku: Optional[str] = Field(default=None, max_length=128)
-    quantity: int = Field(default=1, ge=1, le=9999)
-    due_ship_at: Optional[datetime] = None
-    comment: Optional[str] = Field(default=None, max_length=2000)
-    initial_status: OrderStatus = OrderStatus.ASSEMBLY
-    initial_status_at: Optional[datetime] = None
-
-
 class OrderEventRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: int
     status: OrderStatus
+    status_name: str
     event_at: datetime
-    note: Optional[str] = None
+    note: str | None = None
 
 
 class OrderRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: int
     marketplace: Marketplace
-    external_order_id: str
+    marketplace_name: str
+    assembly_task_number: str
     product_name: str
-    sku: Optional[str]
+    sku: str | None
     quantity: int
-    due_ship_at: Optional[datetime]
     current_status: OrderStatus
+    current_status_name: str
     current_status_at: datetime
-    comment: Optional[str]
     created_at: datetime
     updated_at: datetime
-    events: list[OrderEventRead] = []
+    events: list[OrderEventRead] = Field(default_factory=list)
+
+
+class OrderBrief(BaseModel):
+    assembly_task_number: str
+    current_status: OrderStatus
+    current_status_name: str
+    current_status_at: datetime
 
 
 class OrdersResponse(BaseModel):
@@ -58,18 +43,43 @@ class OrdersResponse(BaseModel):
 
 class DashboardSummary(BaseModel):
     marketplace: Marketplace
+    marketplace_name: str
     total_orders: int
-    active_orders: int
-    overdue_to_ship: int
-    buyout_count: int
-    rejection_count: int
-    return_count: int
-    defect_count: int
-    buyout_rate_percent: float
+    updated_today: int
     by_status: dict[str, int]
 
 
 class StatusCatalogItem(BaseModel):
     code: str
     name: str
+
+
+class SettingsRead(BaseModel):
+    wb_token: str
+    ozon_client_id: str
+    ozon_api_key: str
+    updated_at: datetime | None = None
+
+
+class SettingsUpdate(BaseModel):
+    wb_token: str = Field(default="", max_length=512)
+    ozon_client_id: str = Field(default="", max_length=128)
+    ozon_api_key: str = Field(default="", max_length=512)
+
+
+class SyncReport(BaseModel):
+    wb_received: int
+    ozon_received: int
+    processed_orders: int
+    created_orders: int
+    updated_orders: int
+    created_events: int
+    message: str
+
+
+class TodaySummary(BaseModel):
+    date: str
+    wb_updates: int
+    ozon_updates: int
+    total_updates: int
 

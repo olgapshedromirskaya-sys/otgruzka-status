@@ -3,77 +3,80 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>FBS Tracker · WB / Ozon</title>
+  <title>Отгрузка Status · WB / Ozon</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <main class="container">
     <header class="topbar card">
       <div>
-        <p class="eyebrow">Telegram WebApp</p>
-        <h1>Мой магазин · FBS аналитика</h1>
+        <p class="eyebrow">Телеграм WebApp</p>
+        <h1>Отгрузка Status · FBS мониторинг</h1>
       </div>
-      <button id="refreshBtn" class="btn ghost">Обновить</button>
+      <div class="topbar-actions">
+        <button id="syncBtn" class="btn">Синхронизировать сейчас</button>
+        <button id="refreshBtn" class="btn ghost">Обновить</button>
+      </div>
     </header>
 
-    <section class="tabs card">
-      <button class="tab active" data-marketplace="wb">🔵 WB</button>
-      <button class="tab" data-marketplace="ozon">🔵 Ozon</button>
+    <section class="page-tabs card">
+      <button class="page-tab active" data-page="dashboard">Дашборд</button>
+      <button class="page-tab" data-page="settings">Настройки</button>
     </section>
 
-    <section id="summaryCards" class="grid summary-grid"></section>
+    <section id="dashboardPage" class="page-panel">
+      <section class="tabs card">
+        <button class="tab active" data-marketplace="wb">WB</button>
+        <button class="tab" data-marketplace="ozon">Ozon</button>
+      </section>
 
-    <section class="card block">
-      <div class="block-header">
-        <h2>Новый заказ FBS</h2>
-      </div>
-      <form id="createOrderForm" class="form-grid">
-        <label>
-          Маркетплейс
-          <select name="marketplace" required>
-            <option value="wb">WB</option>
-            <option value="ozon">Ozon</option>
-          </select>
-        </label>
-        <label>
-          Номер заказа
-          <input name="external_order_id" required maxlength="128" />
-        </label>
-        <label>
-          Товар
-          <input name="product_name" required maxlength="256" />
-        </label>
-        <label>
-          SKU/Артикул
-          <input name="sku" maxlength="128" />
-        </label>
-        <label>
-          Кол-во
-          <input name="quantity" type="number" min="1" value="1" />
-        </label>
-        <label>
-          Дедлайн сдачи на склад
-          <input name="due_ship_at" type="datetime-local" />
-        </label>
-        <label class="full">
-          Комментарий
-          <textarea name="comment" rows="2" maxlength="2000"></textarea>
-        </label>
-        <button class="btn full" type="submit">Создать заказ</button>
-      </form>
-    </section>
-
-    <section class="card block">
-      <div class="block-header">
-        <h2>Заказы</h2>
-        <div class="filters">
-          <input id="searchInput" placeholder="Поиск по номеру, SKU, товару..." />
-          <select id="statusFilter">
-            <option value="">Все статусы</option>
-          </select>
+      <section class="card block">
+        <div class="block-header">
+          <h2>Экспорт</h2>
+          <div class="actions-inline">
+            <button id="exportCsvBtn" class="btn ghost">Экспорт в CSV</button>
+            <button id="exportXlsxBtn" class="btn ghost">Экспорт в Excel</button>
+          </div>
         </div>
-      </div>
-      <div id="ordersList" class="orders"></div>
+      </section>
+
+      <section id="summaryCards" class="grid summary-grid"></section>
+
+      <section class="card block">
+        <div class="block-header">
+          <h2>Заказы</h2>
+          <div class="filters">
+            <input id="searchInput" placeholder="Поиск по номеру сборочного задания, товару, SKU..." />
+          </div>
+        </div>
+        <div id="ordersList" class="orders"></div>
+      </section>
+    </section>
+
+    <section id="settingsPage" class="page-panel hidden">
+      <section class="card block">
+        <div class="block-header">
+          <h2>Настройки API</h2>
+        </div>
+        <form id="settingsForm" class="form-grid">
+          <label class="full">
+            Токен WB
+            <input name="wb_token" type="password" autocomplete="off" />
+          </label>
+          <label>
+            Client ID Ozon
+            <input name="ozon_client_id" autocomplete="off" />
+          </label>
+          <label>
+            API-ключ Ozon
+            <input name="ozon_api_key" type="password" autocomplete="off" />
+          </label>
+          <button class="btn full" type="submit">Сохранить настройки</button>
+        </form>
+        <p class="muted-note">
+          После сохранения ключей приложение будет автоматически синхронизировать FBS-заказы WB и Ozon каждые 15 минут.
+        </p>
+      </section>
     </section>
   </main>
 
@@ -87,12 +90,6 @@
         <div class="status-pill"></div>
       </div>
       <div class="timeline"></div>
-      <form class="event-form">
-        <select name="status" required></select>
-        <input name="event_at" type="datetime-local" required />
-        <input name="note" placeholder="Комментарий по событию" maxlength="2000" />
-        <button class="btn small" type="submit">Добавить статус</button>
-      </form>
     </article>
   </template>
 

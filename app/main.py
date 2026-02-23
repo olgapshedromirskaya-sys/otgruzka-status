@@ -28,6 +28,8 @@ from app.services import (
 )
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
 app = FastAPI(title=settings.app_name, version="0.1.0")
 static_dir = Path(__file__).resolve().parent / "static"
 
@@ -40,30 +42,29 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+bot_instance = None
+dp_instance = None
+
 @app.on_event("startup")
 async def startup_event() -> None:
-    logging.basicConfig(level=logging.INFO)
+    global bot_instance, dp_instance
     init_db()
     if settings.bot_token and settings.webapp_url:
-        from aiogram.types import Update
         from app.bot import get_bot, get_dispatcher
-        bot = get_bot()
+        bot_instance = get_bot()
+        dp_instance = get_dispatcher()
         webhook_url = f"{settings.webapp_url}/webhook"
-        await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(webhook_url)
+        await bot_instance.delete_webhook(drop_pending_updates=True)
+        await bot_instance.set_webhook(webhook_url)
         logger.info(f"Webhook set to {webhook_url}")
-        await bot.session.close()
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request) -> dict:
     from aiogram.types import Update
-    from app.bot import get_bot, get_dispatcher
-    bot = get_bot()
-    dp = get_dispatcher()
-    data = await request.json()
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
-    await bot.session.close()
+    if bot_instance and dp_instance:
+        data = await request.json()
+        update = Update.model_validate(data)
+        await dp_instance.feed_update(bot_instance, update)
     return {"ok": True}
 
 @app.get("/health")

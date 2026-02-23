@@ -1,17 +1,21 @@
 const state = {
   currentMarketplace: "wb",
-  statuses: [],
-  statusMap: {},
+  currentPage: "dashboard",
 };
 
 const summaryCards = document.getElementById("summaryCards");
 const ordersList = document.getElementById("ordersList");
-const createOrderForm = document.getElementById("createOrderForm");
 const refreshBtn = document.getElementById("refreshBtn");
-const statusFilter = document.getElementById("statusFilter");
+const syncBtn = document.getElementById("syncBtn");
 const searchInput = document.getElementById("searchInput");
 const orderTemplate = document.getElementById("orderTemplate");
 const tabs = document.querySelectorAll(".tab");
+const pageTabs = document.querySelectorAll(".page-tab");
+const dashboardPage = document.getElementById("dashboardPage");
+const settingsPage = document.getElementById("settingsPage");
+const settingsForm = document.getElementById("settingsForm");
+const exportCsvBtn = document.getElementById("exportCsvBtn");
+const exportXlsxBtn = document.getElementById("exportXlsxBtn");
 
 const STATUS_SEVERITY = {
   buyout: "good",
@@ -20,31 +24,9 @@ const STATUS_SEVERITY = {
   return_started: "warn",
   return_in_transit_from_buyer: "warn",
   return_arrived_to_seller_pickup: "warn",
-  warehouse_handover: "good",
-  sorted: "good",
-  in_transit_to_buyer_pickup: "good",
-  arrived_at_buyer_pickup: "good",
 };
 
-function toIso(inputValue) {
-  if (!inputValue) return null;
-  return new Date(inputValue).toISOString();
-}
-
-function formatDate(isoDate) {
-  if (!isoDate) return "—";
-  return new Date(isoDate).toLocaleString("ru-RU", {
-    dateStyle: "short",
-    timeStyle: "short",
-  });
-}
-
-function nowLocalInputValue() {
-  const date = new Date();
-  const tzOffsetMinutes = date.getTimezoneOffset();
-  const local = new Date(date.getTime() - tzOffsetMinutes * 60 * 1000);
-  return local.toISOString().slice(0, 16);
-}
+let searchDebounce = null;
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -61,6 +43,14 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+function formatDate(isoDate) {
+  if (!isoDate) return "—";
+  return new Date(isoDate).toLocaleString("ru-RU", {
+    dateStyle: "short",
+    timeStyle: "short",
+  });
+}
+
 function summaryCard(label, value, note = "") {
   return `
     <article class="metric-card">
@@ -71,124 +61,63 @@ function summaryCard(label, value, note = "") {
   `;
 }
 
-async function loadMeta() {
-  state.statuses = await api("/api/meta/statuses");
-  state.statusMap = state.statuses.reduce((acc, item) => {
-    acc[item.code] = item.name;
-    return acc;
-  }, {});
-
-  for (const status of state.statuses) {
-    const option = document.createElement("option");
-    option.value = status.code;
-    option.textContent = status.name;
-    statusFilter.appendChild(option);
-  }
+function setPage(page) {
+  state.currentPage = page;
+  pageTabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.page === page));
+  dashboardPage.classList.toggle("hidden", page !== "dashboard");
+  settingsPage.classList.toggle("hidden", page !== "settings");
 }
 
-function setTab(marketplace) {
+function setMarketplace(marketplace) {
   state.currentMarketplace = marketplace;
   tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.marketplace === marketplace));
-  createOrderForm.marketplace.value = marketplace;
 }
 
 function renderSummary(summary) {
-  summaryCards.innerHTML = [
-    summaryCard("Заказов всего", summary.total_orders),
-    summaryCard("Активные", summary.active_orders),
-    summaryCard("Просрочено к отгрузке", summary.overdue_to_ship),
-    summaryCard("Выкуп", summary.buyout_count, `${summary.buyout_rate_percent}%`),
-    summaryCard("Отказ", summary.rejection_count),
-    summaryCard("Возвраты", summary.return_count),
-    summaryCard("Брак", summary.defect_count),
-    summaryCard(
-      "Сборка / сортировка",
-      `${summary.by_status.assembly || 0} / ${summary.by_status.sorted || 0}`,
-      "по текущим статусам"
-    ),
-  ].join("");
+  const baseCards = [
+    summaryCard("Заказов в базе", summary.total_orders),
+    summaryCard("Обновлено сегодня", summary.updated_today),
+  ];
+  const statusCards = Object.entries(summary.by_status || {}).map(([statusName, count]) =>
+    summaryCard(statusName, count)
+  );
+  summaryCards.innerHTML = [...baseCards, ...statusCards].join("");
 }
 
 function renderEventItem(event) {
   return `
     <div class="event-item">
-      <strong>${state.statusMap[event.status] || event.status}</strong>
-      — ${formatDate(event.event_at)}
+      <strong>${event.status_name}</strong> — ${formatDate(event.event_at)}
       ${event.note ? `<br/>${event.note}` : ""}
     </div>
   `;
 }
 
-function fillStatusSelect(selectEl) {
-  selectEl.innerHTML = state.statuses
-    .map((status) => `<option value="${status.code}">${status.name}</option>`)
-    .join("");
-}
-
-async function submitOrderEvent(orderId, form) {
-  const data = new FormData(form);
-  await api(`/api/orders/${orderId}/events`, {
-    method: "POST",
-    body: JSON.stringify({
-      status: data.get("status"),
-      event_at: toIso(data.get("event_at")),
-      note: data.get("note") || null,
-    }),
-  });
-}
-
 function renderOrders(items) {
   ordersList.innerHTML = "";
   if (!items.length) {
-    ordersList.innerHTML = `<div class="empty">Нет заказов по выбранным фильтрам.</div>`;
+    ordersList.innerHTML = `<div class="empty">Заказы не найдены.</div>`;
     return;
   }
 
   for (const order of items) {
     const fragment = orderTemplate.content.cloneNode(true);
-    const card = fragment.querySelector(".order-card");
     const title = fragment.querySelector(".order-title");
     const subtitle = fragment.querySelector(".order-subtitle");
     const pill = fragment.querySelector(".status-pill");
     const timeline = fragment.querySelector(".timeline");
-    const eventForm = fragment.querySelector(".event-form");
-    const statusSelect = eventForm.querySelector("select[name='status']");
-    const eventAtInput = eventForm.querySelector("input[name='event_at']");
 
-    title.textContent = `${order.product_name} ×${order.quantity}`;
-    subtitle.textContent = `${order.marketplace.toUpperCase()} • №${order.external_order_id} • SKU: ${
-      order.sku || "—"
-    } • дедлайн сдачи: ${formatDate(order.due_ship_at)}`;
-    pill.textContent = `${state.statusMap[order.current_status] || order.current_status} · ${formatDate(
-      order.current_status_at
-    )}`;
+    title.textContent = `Сборочное задание №${order.assembly_task_number}`;
+    subtitle.textContent = `${order.marketplace_name} • ${order.product_name} • SKU: ${order.sku || "—"} • Кол-во: ${
+      order.quantity
+    }`;
+    pill.textContent = `${order.current_status_name} · ${formatDate(order.current_status_at)}`;
     pill.classList.add(STATUS_SEVERITY[order.current_status] || "");
 
     timeline.innerHTML = order.events.length
-      ? order.events
-          .slice()
-          .sort((a, b) => new Date(b.event_at) - new Date(a.event_at))
-          .map((event) => renderEventItem(event))
-          .join("")
-      : `<div class="event-item">Нет событий.</div>`;
+      ? order.events.map((event) => renderEventItem(event)).join("")
+      : `<div class="event-item">История статусов пока пуста.</div>`;
 
-    fillStatusSelect(statusSelect);
-    eventAtInput.value = nowLocalInputValue();
-    eventForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const button = eventForm.querySelector("button");
-      button.disabled = true;
-      try {
-        await submitOrderEvent(order.id, eventForm);
-        await reload();
-      } catch (error) {
-        alert(error.message);
-      } finally {
-        button.disabled = false;
-      }
-    });
-
-    card.dataset.orderId = order.id;
     ordersList.appendChild(fragment);
   }
 }
@@ -200,71 +129,112 @@ async function loadSummary() {
 
 async function loadOrders() {
   const search = searchInput.value.trim();
-  const status = statusFilter.value;
-  const query = new URLSearchParams({ marketplace: state.currentMarketplace, limit: "200" });
+  const query = new URLSearchParams({
+    marketplace: state.currentMarketplace,
+    limit: "200",
+  });
   if (search) query.set("search", search);
-  if (status) query.set("status", status);
   const payload = await api(`/api/orders?${query.toString()}`);
   renderOrders(payload.items || []);
 }
 
-async function reload() {
+async function loadSettings() {
+  const payload = await api("/api/settings");
+  settingsForm.wb_token.value = payload.wb_token || "";
+  settingsForm.ozon_client_id.value = payload.ozon_client_id || "";
+  settingsForm.ozon_api_key.value = payload.ozon_api_key || "";
+}
+
+async function saveSettings() {
+  const data = new FormData(settingsForm);
+  const submitButton = settingsForm.querySelector("button[type='submit']");
+  submitButton.disabled = true;
+  try {
+    await api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        wb_token: data.get("wb_token") || "",
+        ozon_client_id: data.get("ozon_client_id") || "",
+        ozon_api_key: data.get("ozon_api_key") || "",
+      }),
+    });
+    alert("Настройки сохранены.");
+  } finally {
+    submitButton.disabled = false;
+  }
+}
+
+async function runSync() {
+  syncBtn.disabled = true;
+  try {
+    const report = await api("/api/sync/run", { method: "POST" });
+    alert(
+      `${report.message}\nWB: ${report.wb_received}\nOzon: ${report.ozon_received}\nОбработано: ${report.processed_orders}`
+    );
+    await reloadDashboard();
+  } finally {
+    syncBtn.disabled = false;
+  }
+}
+
+function exportCsv() {
+  window.location.href = "/api/export/orders.csv";
+}
+
+function exportXlsx() {
+  window.location.href = "/api/export/orders.xlsx";
+}
+
+async function reloadDashboard() {
   await Promise.all([loadSummary(), loadOrders()]);
 }
 
 function bindEvents() {
   tabs.forEach((tab) => {
     tab.addEventListener("click", async () => {
-      setTab(tab.dataset.marketplace);
-      await reload();
+      setMarketplace(tab.dataset.marketplace);
+      await reloadDashboard();
     });
   });
 
-  refreshBtn.addEventListener("click", reload);
+  pageTabs.forEach((tab) => {
+    tab.addEventListener("click", async () => {
+      setPage(tab.dataset.page);
+      if (tab.dataset.page === "settings") {
+        await loadSettings();
+      }
+    });
+  });
+
+  refreshBtn.addEventListener("click", () => {
+    reloadDashboard().catch((error) => alert(error.message));
+  });
+
+  syncBtn.addEventListener("click", () => {
+    runSync().catch((error) => alert(error.message));
+  });
+
   searchInput.addEventListener("input", () => {
-    loadOrders().catch((error) => alert(error.message));
-  });
-  statusFilter.addEventListener("change", () => {
-    loadOrders().catch((error) => alert(error.message));
+    if (searchDebounce) clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => {
+      loadOrders().catch((error) => alert(error.message));
+    }, 250);
   });
 
-  createOrderForm.addEventListener("submit", async (event) => {
+  settingsForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    const data = new FormData(createOrderForm);
-    const submitButton = createOrderForm.querySelector("button[type='submit']");
-    submitButton.disabled = true;
-
-    try {
-      await api("/api/orders", {
-        method: "POST",
-        body: JSON.stringify({
-          marketplace: data.get("marketplace"),
-          external_order_id: data.get("external_order_id"),
-          product_name: data.get("product_name"),
-          sku: data.get("sku") || null,
-          quantity: Number(data.get("quantity") || 1),
-          due_ship_at: toIso(data.get("due_ship_at")),
-          comment: data.get("comment") || null,
-          initial_status: "assembly",
-          initial_status_at: new Date().toISOString(),
-        }),
-      });
-      createOrderForm.reset();
-      createOrderForm.marketplace.value = state.currentMarketplace;
-      await reload();
-    } catch (error) {
-      alert(error.message);
-    } finally {
-      submitButton.disabled = false;
-    }
+    saveSettings().catch((error) => alert(error.message));
   });
+
+  exportCsvBtn.addEventListener("click", exportCsv);
+  exportXlsxBtn.addEventListener("click", exportXlsx);
 }
 
 async function bootstrap() {
-  await loadMeta();
-  setTab("wb");
+  setMarketplace("wb");
+  setPage("dashboard");
   bindEvents();
-  await reload();
+  await reloadDashboard();
 }
 
 bootstrap().catch((error) => {

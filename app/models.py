@@ -62,3 +62,21 @@ class OrderEvent(Base):
 
     order: Mapped[Order] = relationship("Order", back_populates="events")
 
+
+class Settings(Base):
+    __tablename__ = "settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    wb_token: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    ozon_client_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    ozon_api_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+

@@ -20,8 +20,8 @@ class OrderStatus(str, Enum):
     SELLER_PICKED_UP = "seller_picked_up"
 
 MARKETPLACE_LABELS = {
-    Marketplace.WB: "Wildberries",
-    Marketplace.OZON: "Ozon",
+    Marketplace.WB: "Вайлдберриз",
+    Marketplace.OZON: "Озон",
 }
 
 STATUS_LABELS = {

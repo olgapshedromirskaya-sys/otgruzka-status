@@ -4,3 +4,6 @@ sqlalchemy
 pydantic
 python-dotenv
 aiogram
+APScheduler
+openpyxl
+httpx

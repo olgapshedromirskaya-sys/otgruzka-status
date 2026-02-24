@@ -120,7 +120,10 @@ function renderOrders(items) {
       order.quantity
     }`;
     pill.textContent = `${order.current_status_name} · ${formatDate(order.current_status_at)}`;
-    pill.classList.add(STATUS_SEVERITY[order.current_status] || "");
+    const severityClass = STATUS_SEVERITY[order.current_status] || "";
+    if (severityClass) {
+      pill.classList.add(severityClass);
+    }
 
     timeline.innerHTML = order.events.length
       ? order.events.map((event) => renderEventItem(event)).join("")

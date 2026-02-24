@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote_plus
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -13,11 +14,10 @@ from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
 from sqlalchemy.orm import Session
 
-from app.auth import extract_telegram_id_from_init_data
+from app.auth import build_signed_init_data, extract_telegram_id_from_init_data
 from app.config import settings
 from app.db import get_session, init_db, session_scope
 from app.enums import Marketplace
-from app.models import User
 from app.schemas import (
     DashboardSummary,
     OrdersResponse,
@@ -30,7 +30,6 @@ from app.services import (
     build_summary,
     ensure_owner_user,
     export_rows,
-    get_user_by_telegram_id,
     get_settings,
     list_orders,
     marketplace_catalog,
@@ -68,32 +67,33 @@ def _extract_init_data(request: Request) -> str:
     )
 
 
-def get_authorized_webapp_user(
-    request: Request,
-    session: Session = Depends(get_session),
-) -> User:
+def _verify_webhook_init_data(request: Request) -> None:
     init_data = _extract_init_data(request)
     if not init_data:
         raise HTTPException(
             status_code=401,
-            detail="Требуется авторизация Telegram WebApp",
+            detail="Требуется авторизация Telegram initData",
         )
 
     try:
-        telegram_id = extract_telegram_id_from_init_data(init_data, settings.bot_token)
+        extract_telegram_id_from_init_data(init_data, settings.bot_token)
     except ValueError as exc:
         raise HTTPException(
             status_code=401,
-            detail=f"Ошибка авторизации Telegram WebApp: {exc}",
+            detail=f"Ошибка авторизации webhook: {exc}",
         ) from exc
 
-    user = get_user_by_telegram_id(session, telegram_id)
-    if not user:
-        raise HTTPException(
-            status_code=403,
-            detail="У вас нет доступа. Обратитесь к руководителю.",
-        )
-    return user
+
+def _build_webhook_url() -> str:
+    base_url = settings.webapp_url.rstrip("/")
+    bot_id_raw = settings.bot_token.split(":", maxsplit=1)[0]
+    try:
+        bot_id = int(bot_id_raw)
+    except ValueError as exc:
+        raise RuntimeError("Некорректный BOT_TOKEN: не удалось определить bot_id") from exc
+
+    signed_init_data = build_signed_init_data(settings.bot_token, bot_id)
+    return f"{base_url}/webhook?init_data={quote_plus(signed_init_data)}"
 
 
 async def _scheduled_sync_job() -> None:
@@ -138,10 +138,10 @@ async def startup_event() -> None:
 
         bot_instance = get_bot()
         dp_instance = get_dispatcher()
-        webhook_url = f"{settings.webapp_url}/webhook"
+        webhook_url = _build_webhook_url()
         await bot_instance.delete_webhook(drop_pending_updates=True)
         await bot_instance.set_webhook(webhook_url)
-        logger.info("Webhook set to %s", webhook_url)
+        logger.info("Webhook set to %s/webhook", settings.webapp_url.rstrip("/"))
 
 
 @app.on_event("shutdown")
@@ -156,6 +156,7 @@ async def shutdown_event() -> None:
 async def telegram_webhook(request: Request) -> dict:
     from aiogram.types import Update
 
+    _verify_webhook_init_data(request)
     if bot_instance and dp_instance:
         data = await request.json()
         update = Update.model_validate(data)
@@ -169,17 +170,17 @@ def health_check() -> dict[str, str]:
 
 
 @app.get("/")
-def serve_web_app(_: User = Depends(get_authorized_webapp_user)) -> FileResponse:
+def serve_web_app() -> FileResponse:
     return FileResponse(static_dir / "index.html")
 
 
 @app.get("/api/meta/statuses", response_model=list[StatusCatalogItem])
-def get_statuses(_: User = Depends(get_authorized_webapp_user)) -> list[StatusCatalogItem]:
+def get_statuses() -> list[StatusCatalogItem]:
     return status_catalog()
 
 
 @app.get("/api/meta/marketplaces")
-def get_marketplaces(_: User = Depends(get_authorized_webapp_user)) -> list[dict[str, str]]:
+def get_marketplaces() -> list[dict[str, str]]:
     return marketplace_catalog()
 
 
@@ -190,7 +191,6 @@ def list_orders_endpoint(
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_session),
-    _: User = Depends(get_authorized_webapp_user),
 ) -> OrdersResponse:
     items, total = list_orders(
         session=session,
@@ -206,7 +206,6 @@ def list_orders_endpoint(
 def dashboard_marketplace_endpoint(
     marketplace: Marketplace,
     session: Session = Depends(get_session),
-    _: User = Depends(get_authorized_webapp_user),
 ) -> DashboardSummary:
     return build_summary(session, marketplace)
 
@@ -214,7 +213,6 @@ def dashboard_marketplace_endpoint(
 @app.get("/api/dashboard")
 def dashboard_all_endpoint(
     session: Session = Depends(get_session),
-    _: User = Depends(get_authorized_webapp_user),
 ) -> list[DashboardSummary]:
     return [build_summary(session, marketplace) for marketplace in Marketplace]
 
@@ -222,7 +220,6 @@ def dashboard_all_endpoint(
 @app.get("/api/settings", response_model=SettingsRead)
 def settings_read_endpoint(
     session: Session = Depends(get_session),
-    _: User = Depends(get_authorized_webapp_user),
 ) -> SettingsRead:
     return get_settings(session)
 
@@ -231,20 +228,18 @@ def settings_read_endpoint(
 def settings_update_endpoint(
     payload: SettingsUpdate,
     session: Session = Depends(get_session),
-    _: User = Depends(get_authorized_webapp_user),
 ) -> SettingsRead:
     return save_settings(session, payload)
 
 
 @app.post("/api/sync/run", response_model=SyncReport)
-async def run_sync_endpoint(_: User = Depends(get_authorized_webapp_user)) -> SyncReport:
+async def run_sync_endpoint() -> SyncReport:
     return await sync_orders_from_marketplaces()
 
 
 @app.get("/api/export/orders.csv")
 def export_orders_csv_endpoint(
     session: Session = Depends(get_session),
-    _: User = Depends(get_authorized_webapp_user),
 ) -> StreamingResponse:
     rows = export_rows(session)
     columns = [
@@ -272,7 +267,6 @@ def export_orders_csv_endpoint(
 @app.get("/api/export/orders.xlsx")
 def export_orders_xlsx_endpoint(
     session: Session = Depends(get_session),
-    _: User = Depends(get_authorized_webapp_user),
 ) -> StreamingResponse:
     rows = export_rows(session)
     columns = [

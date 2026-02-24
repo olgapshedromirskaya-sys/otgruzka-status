@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import time
 from urllib.parse import parse_qsl
 
 
@@ -42,3 +43,23 @@ def extract_telegram_id_from_init_data(init_data: str, bot_token: str) -> int:
     if telegram_id <= 0:
         raise ValueError("Telegram ID должен быть положительным числом")
     return telegram_id
+
+
+def build_signed_init_data(bot_token: str, telegram_id: int) -> str:
+    if not bot_token:
+        raise ValueError("BOT_TOKEN не задан")
+    if telegram_id <= 0:
+        raise ValueError("Telegram ID должен быть положительным числом")
+
+    payload = {
+        "auth_date": str(int(time.time())),
+        "user": json.dumps({"id": telegram_id}, separators=(",", ":"), ensure_ascii=False),
+    }
+    data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(payload.items()))
+    secret_key = hmac.new(b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256).digest()
+    payload_hash = hmac.new(
+        secret_key,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"auth_date={payload['auth_date']}&user={payload['user']}&hash={payload_hash}"

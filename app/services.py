@@ -32,9 +32,11 @@ REQUEST_PAUSE_SECONDS = 0.45
 MAX_WB_PAGES = 20
 MAX_OZON_PAGES = 30
 RECENT_ORDERS_DAYS = 30
+WB_STATUS_BATCH_SIZE = 1000
 
 WB_NEW_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders/new"
 WB_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders"
+WB_ORDERS_STATUS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders/status"
 OZON_FBS_LIST_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
 
 
@@ -240,6 +242,21 @@ def _extract_wb_orders(payload: Any) -> list[dict[str, Any]]:
         return []
 
     return [item for item in orders_payload if isinstance(item, dict)]
+
+
+def _extract_wb_order_statuses(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    statuses_payload = payload.get("orders") or payload.get("data") or payload.get("statuses") or payload.get("result") or []
+    if isinstance(statuses_payload, dict):
+        statuses_payload = statuses_payload.get("orders") or statuses_payload.get("statuses") or []
+    if not isinstance(statuses_payload, list):
+        return []
+
+    return [item for item in statuses_payload if isinstance(item, dict)]
 
 
 def _normalize_status_text(raw_status: str | int | None) -> str:
@@ -548,6 +565,19 @@ def _extract_wb_task_number(item: dict[str, Any]) -> str:
     ).strip()
 
 
+def _extract_wb_order_id(item: dict[str, Any]) -> int | None:
+    raw_id = item.get("id") or item.get("orderId") or item.get("order_id")
+    if raw_id is None:
+        return None
+    try:
+        parsed = int(str(raw_id).strip())
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
 def _extract_wb_supplier_status(item: dict[str, Any]) -> Any:
     return item.get("supplierStatus") or item.get("supplier_status")
 
@@ -579,6 +609,88 @@ def _log_wb_status_preview(items: list[dict[str, Any]], limit: int = 5) -> None:
         )
     if preview:
         logger.info("WB API первые %s заказов supplierStatus/wbStatus: %s", len(preview), preview)
+
+
+async def _fetch_wb_statuses_by_order_id(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    orders: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    unique_order_ids: list[int] = []
+    seen_ids: set[int] = set()
+    for order in orders:
+        order_id = _extract_wb_order_id(order)
+        if order_id is None or order_id in seen_ids:
+            continue
+        seen_ids.add(order_id)
+        unique_order_ids.append(order_id)
+
+    if not unique_order_ids:
+        return {}
+
+    statuses_by_order_id: dict[int, dict[str, Any]] = {}
+    for batch_start in range(0, len(unique_order_ids), WB_STATUS_BATCH_SIZE):
+        batch_ids = unique_order_ids[batch_start : batch_start + WB_STATUS_BATCH_SIZE]
+        batch_payload = {"orders": [{"id": order_id} for order_id in batch_ids]}
+        response = await client.post(WB_ORDERS_STATUS_URL, headers=headers, json=batch_payload)
+        _log_marketplace_response("WB", response)
+        try:
+            payload: Any = response.json()
+        except ValueError:
+            payload = response.text
+        logger.info(
+            "WB API /orders/status JSON[batch=%s size=%s][0:500]=%s",
+            (batch_start // WB_STATUS_BATCH_SIZE) + 1,
+            len(batch_ids),
+            _payload_preview(payload),
+        )
+        if response.status_code == 429:
+            logger.warning("WB API вернул 429, ожидание перед повтором /orders/status")
+            await asyncio.sleep(2.0)
+            response = await client.post(WB_ORDERS_STATUS_URL, headers=headers, json=batch_payload)
+            _log_marketplace_response("WB", response)
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = response.text
+            logger.info(
+                "WB API /orders/status (retry) JSON[batch=%s size=%s][0:500]=%s",
+                (batch_start // WB_STATUS_BATCH_SIZE) + 1,
+                len(batch_ids),
+                _payload_preview(payload),
+            )
+        response.raise_for_status()
+
+        for status_item in _extract_wb_order_statuses(payload):
+            status_order_id = _extract_wb_order_id(status_item)
+            if status_order_id is None:
+                continue
+            statuses_by_order_id[status_order_id] = status_item
+
+        if batch_start + WB_STATUS_BATCH_SIZE < len(unique_order_ids):
+            await asyncio.sleep(REQUEST_PAUSE_SECONDS)
+
+    return statuses_by_order_id
+
+
+def _merge_wb_statuses_into_orders(
+    orders: list[dict[str, Any]],
+    statuses_by_order_id: dict[int, dict[str, Any]],
+) -> None:
+    for order in orders:
+        order_id = _extract_wb_order_id(order)
+        if order_id is None:
+            continue
+        status_payload = statuses_by_order_id.get(order_id)
+        if not status_payload:
+            continue
+
+        supplier_status = status_payload.get("supplierStatus")
+        wb_status = status_payload.get("wbStatus")
+        if supplier_status is not None:
+            order["supplierStatus"] = supplier_status
+        if wb_status is not None:
+            order["wbStatus"] = wb_status
 
 
 def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
@@ -679,6 +791,7 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
     headers = {"Authorization": wb_token.strip()}
     snapshots: list[ExternalOrderSnapshot] = []
     status_preview_items: list[dict[str, Any]] = []
+    all_wb_orders: list[dict[str, Any]] = []
     recent_from, _ = _recent_period_utc()
     next_cursor: int | str = 0
 
@@ -709,21 +822,7 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
         response.raise_for_status()
 
         initial_orders_payload = _extract_wb_orders(initial_payload)
-        _append_wb_status_preview_items(initial_orders_payload, status_preview_items)
-        for item in initial_orders_payload:
-            normalized = _normalize_wb_order(item)
-            if not normalized:
-                continue
-            created_at = _parse_datetime(item.get("createdAt"), fallback=normalized.status_at)
-            if created_at < recent_from:
-                logger.info(
-                    "WB заказ пропущен (createdAt старше %s дней): id=%s createdAt=%s",
-                    RECENT_ORDERS_DAYS,
-                    normalized.assembly_task_number,
-                    _to_iso8601_utc(created_at),
-                )
-                continue
-            snapshots.append(normalized)
+        all_wb_orders.extend(initial_orders_payload)
 
         for _ in range(MAX_WB_PAGES):
             params: dict[str, Any] = {"limit": 1000, "next": next_cursor}
@@ -748,28 +847,32 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
             orders_payload = _extract_wb_orders(payload)
             if not orders_payload:
                 break
-            _append_wb_status_preview_items(orders_payload, status_preview_items)
-
-            for item in orders_payload:
-                normalized = _normalize_wb_order(item)
-                if not normalized:
-                    continue
-                created_at = _parse_datetime(item.get("createdAt"), fallback=normalized.status_at)
-                if created_at < recent_from:
-                    logger.info(
-                        "WB заказ пропущен (createdAt старше %s дней): id=%s createdAt=%s",
-                        RECENT_ORDERS_DAYS,
-                        normalized.assembly_task_number,
-                        _to_iso8601_utc(created_at),
-                    )
-                    continue
-                snapshots.append(normalized)
+            all_wb_orders.extend(orders_payload)
 
             new_next = payload.get("next") if isinstance(payload, dict) else None
             if new_next in (None, "", 0) or new_next == next_cursor:
                 break
             next_cursor = new_next
             await asyncio.sleep(REQUEST_PAUSE_SECONDS)
+
+        statuses_by_order_id = await _fetch_wb_statuses_by_order_id(client, headers, all_wb_orders)
+        _merge_wb_statuses_into_orders(all_wb_orders, statuses_by_order_id)
+        _append_wb_status_preview_items(all_wb_orders, status_preview_items)
+
+        for item in all_wb_orders:
+            normalized = _normalize_wb_order(item)
+            if not normalized:
+                continue
+            created_at = _parse_datetime(item.get("createdAt"), fallback=normalized.status_at)
+            if created_at < recent_from:
+                logger.info(
+                    "WB заказ пропущен (createdAt старше %s дней): id=%s createdAt=%s",
+                    RECENT_ORDERS_DAYS,
+                    normalized.assembly_task_number,
+                    _to_iso8601_utc(created_at),
+                )
+                continue
+            snapshots.append(normalized)
     _log_wb_status_preview(status_preview_items)
     return snapshots
 

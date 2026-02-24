@@ -32,7 +32,7 @@ REQUEST_PAUSE_SECONDS = 0.45
 MAX_WB_PAGES = 20
 MAX_OZON_PAGES = 30
 RECENT_ORDERS_DAYS = 30
-WB_STATUS_BATCH_SIZE = 1000
+WB_STATUS_BATCH_SIZE = 100
 
 WB_NEW_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders/new"
 WB_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders"
@@ -633,13 +633,22 @@ async def _fetch_wb_statuses_by_order_id(
         batch_ids = unique_order_ids[batch_start : batch_start + WB_STATUS_BATCH_SIZE]
         batch_orders = [{"id": int(order_id)} for order_id in batch_ids]
         batch_payload = {"orders": batch_orders}
+        request_headers = {
+            **headers,
+            "Content-Type": "application/json",
+        }
         logger.info(
             "WB API /orders/status отправка batch=%s size=%s первые 3 orders=%s",
             (batch_start // WB_STATUS_BATCH_SIZE) + 1,
             len(batch_orders),
             batch_orders[:3],
         )
-        response = await client.post(WB_ORDERS_STATUS_URL, headers=headers, json=batch_payload)
+        if batch_start == 0:
+            logger.info(
+                "WB API /orders/status request body batch=1: %s",
+                json.dumps(batch_payload, ensure_ascii=False),
+            )
+        response = await client.post(WB_ORDERS_STATUS_URL, headers=request_headers, json=batch_payload)
         _log_marketplace_response("WB", response)
         try:
             payload: Any = response.json()
@@ -654,7 +663,7 @@ async def _fetch_wb_statuses_by_order_id(
         if response.status_code == 429:
             logger.warning("WB API вернул 429, ожидание перед повтором /orders/status")
             await asyncio.sleep(2.0)
-            response = await client.post(WB_ORDERS_STATUS_URL, headers=headers, json=batch_payload)
+            response = await client.post(WB_ORDERS_STATUS_URL, headers=request_headers, json=batch_payload)
             _log_marketplace_response("WB", response)
             try:
                 payload = response.json()

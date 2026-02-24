@@ -37,6 +37,7 @@ WB_STATUS_BATCH_SIZE = 100
 WB_NEW_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders/new"
 WB_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders"
 WB_ORDERS_STATUS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders/status"
+WB_SUPPLY_ORDERS_URL_TEMPLATE = "https://marketplace-api.wildberries.ru/api/v3/supplies/{supply_id}/orders"
 OZON_FBS_LIST_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
 
 
@@ -586,6 +587,31 @@ def _extract_wb_status(item: dict[str, Any]) -> Any:
     return item.get("wbStatus") or item.get("wb_status")
 
 
+def _is_wb_status_missing(raw_status: Any) -> bool:
+    if raw_status is None:
+        return True
+    if isinstance(raw_status, str):
+        return not raw_status.strip()
+    return False
+
+
+def _log_wb_first_order_fields(orders: list[dict[str, Any]]) -> None:
+    if not orders:
+        logger.info("WB API /orders: список заказов пуст, первый заказ отсутствует")
+        return
+
+    first_order = orders[0]
+    logger.info(
+        "WB API /orders первый заказ поля (%s): %s",
+        len(first_order),
+        sorted(first_order.keys()),
+    )
+    logger.info(
+        "WB API /orders первый заказ целиком: %s",
+        json.dumps(first_order, ensure_ascii=False, default=str),
+    )
+
+
 def _append_wb_status_preview_items(
     source: list[dict[str, Any]],
     preview_items: list[dict[str, Any]],
@@ -632,24 +658,15 @@ async def _fetch_wb_statuses_by_order_id(
     try:
         for batch_start in range(0, len(unique_order_ids), WB_STATUS_BATCH_SIZE):
             batch_ids = unique_order_ids[batch_start : batch_start + WB_STATUS_BATCH_SIZE]
-            batch_orders = [{"id": int(order_id)} for order_id in batch_ids]
-            batch_payload = {"orders": batch_orders}
-            request_headers = {
-                **headers,
-                "Content-Type": "application/json",
-            }
+            query_orders = ",".join(str(order_id) for order_id in batch_ids)
+            params = {"orders": query_orders}
             logger.info(
-                "WB API /orders/status отправка batch=%s size=%s первые 3 orders=%s",
+                "WB API /orders/status GET batch=%s size=%s первые 3 ids=%s",
                 (batch_start // WB_STATUS_BATCH_SIZE) + 1,
-                len(batch_orders),
-                batch_orders[:3],
+                len(batch_ids),
+                batch_ids[:3],
             )
-            if batch_start == 0:
-                logger.info(
-                    "WB API /orders/status request body batch=1: %s",
-                    json.dumps(batch_payload, ensure_ascii=False),
-                )
-            response = await client.post(WB_ORDERS_STATUS_URL, headers=request_headers, json=batch_payload)
+            response = await client.get(WB_ORDERS_STATUS_URL, headers=headers, params=params)
             _log_marketplace_response("WB", response)
             try:
                 payload: Any = response.json()
@@ -664,7 +681,7 @@ async def _fetch_wb_statuses_by_order_id(
             if response.status_code == 429:
                 logger.warning("WB API вернул 429, ожидание перед повтором /orders/status")
                 await asyncio.sleep(2.0)
-                response = await client.post(WB_ORDERS_STATUS_URL, headers=request_headers, json=batch_payload)
+                response = await client.get(WB_ORDERS_STATUS_URL, headers=headers, params=params)
                 _log_marketplace_response("WB", response)
                 try:
                     payload = response.json()
@@ -693,6 +710,82 @@ async def _fetch_wb_statuses_by_order_id(
             exc_info=True,
         )
         return {}
+
+    return statuses_by_order_id
+
+
+async def _fetch_wb_statuses_from_supplies(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    orders: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    unique_supply_ids: list[str] = []
+    seen_supply_ids: set[str] = set()
+    for order in orders:
+        raw_supply_id = order.get("supplyId", order.get("supply_id"))
+        if not _has_wb_supply_id(raw_supply_id):
+            continue
+        supply_id = str(raw_supply_id).strip()
+        if not supply_id or supply_id in seen_supply_ids:
+            continue
+        seen_supply_ids.add(supply_id)
+        unique_supply_ids.append(supply_id)
+
+    if not unique_supply_ids:
+        return {}
+
+    statuses_by_order_id: dict[int, dict[str, Any]] = {}
+    for index, supply_id in enumerate(unique_supply_ids, start=1):
+        supply_orders_url = WB_SUPPLY_ORDERS_URL_TEMPLATE.format(supply_id=supply_id)
+        logger.info(
+            "WB API /supplies/{supplyId}/orders запрос supplyId=%s (%s/%s)",
+            supply_id,
+            index,
+            len(unique_supply_ids),
+        )
+        try:
+            response = await client.get(supply_orders_url, headers=headers)
+            _log_marketplace_response("WB", response)
+            try:
+                payload: Any = response.json()
+            except ValueError:
+                payload = response.text
+            logger.info(
+                "WB API /supplies/%s/orders JSON[0:500]=%s",
+                supply_id,
+                _payload_preview(payload),
+            )
+            if response.status_code == 429:
+                logger.warning("WB API вернул 429, ожидание перед повтором /supplies/%s/orders", supply_id)
+                await asyncio.sleep(2.0)
+                response = await client.get(supply_orders_url, headers=headers)
+                _log_marketplace_response("WB", response)
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = response.text
+                logger.info(
+                    "WB API /supplies/%s/orders (retry) JSON[0:500]=%s",
+                    supply_id,
+                    _payload_preview(payload),
+                )
+            response.raise_for_status()
+        except Exception:
+            logger.warning(
+                "WB API /supplies/{supplyId}/orders не удалось получить заказы supplyId=%s",
+                supply_id,
+                exc_info=True,
+            )
+            continue
+
+        for status_item in _extract_wb_orders(payload):
+            status_order_id = _extract_wb_order_id(status_item)
+            if status_order_id is None:
+                continue
+            statuses_by_order_id[status_order_id] = status_item
+
+        if index < len(unique_supply_ids):
+            await asyncio.sleep(REQUEST_PAUSE_SECONDS)
 
     return statuses_by_order_id
 
@@ -816,6 +909,7 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
     snapshots: list[ExternalOrderSnapshot] = []
     status_preview_items: list[dict[str, Any]] = []
     all_wb_orders: list[dict[str, Any]] = []
+    wb_orders_payload: list[dict[str, Any]] = []
     recent_from, _ = _recent_period_utc()
     next_cursor: int | str = 0
 
@@ -872,6 +966,7 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
             if not orders_payload:
                 break
             all_wb_orders.extend(orders_payload)
+            wb_orders_payload.extend(orders_payload)
 
             new_next = payload.get("next") if isinstance(payload, dict) else None
             if new_next in (None, "", 0) or new_next == next_cursor:
@@ -879,8 +974,42 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
             next_cursor = new_next
             await asyncio.sleep(REQUEST_PAUSE_SECONDS)
 
-        statuses_by_order_id = await _fetch_wb_statuses_by_order_id(client, headers, all_wb_orders)
-        _merge_wb_statuses_into_orders(all_wb_orders, statuses_by_order_id)
+        _log_wb_first_order_fields(wb_orders_payload)
+        wb_status_in_every_order = bool(wb_orders_payload) and all(
+            not _is_wb_status_missing(_extract_wb_status(item))
+            for item in wb_orders_payload
+        )
+        if wb_status_in_every_order:
+            logger.info(
+                "WB API /orders содержит wbStatus в каждом заказе, отдельный вызов /orders/status не нужен"
+            )
+        else:
+            missing_status_orders = [
+                item for item in all_wb_orders if _is_wb_status_missing(_extract_wb_status(item))
+            ]
+            if missing_status_orders:
+                logger.info(
+                    "WB API /orders: у %s заказов отсутствует wbStatus, пробуем GET /orders/status",
+                    len(missing_status_orders),
+                )
+                statuses_by_order_id = await _fetch_wb_statuses_by_order_id(client, headers, missing_status_orders)
+                _merge_wb_statuses_into_orders(all_wb_orders, statuses_by_order_id)
+
+                missing_status_orders = [
+                    item for item in all_wb_orders if _is_wb_status_missing(_extract_wb_status(item))
+                ]
+                if missing_status_orders:
+                    logger.info(
+                        "WB API /orders/status не заполнил wbStatus для %s заказов, пробуем /supplies/{supplyId}/orders",
+                        len(missing_status_orders),
+                    )
+                    supply_statuses_by_order_id = await _fetch_wb_statuses_from_supplies(
+                        client,
+                        headers,
+                        missing_status_orders,
+                    )
+                    _merge_wb_statuses_into_orders(all_wb_orders, supply_statuses_by_order_id)
+
         _append_wb_status_preview_items(all_wb_orders, status_preview_items)
 
         for item in all_wb_orders:

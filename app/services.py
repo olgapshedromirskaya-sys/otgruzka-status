@@ -31,6 +31,7 @@ SYNC_LOCK = asyncio.Lock()
 REQUEST_PAUSE_SECONDS = 0.45
 MAX_WB_PAGES = 20
 MAX_OZON_PAGES = 30
+RECENT_ORDERS_DAYS = 30
 
 WB_NEW_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders/new"
 WB_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders"
@@ -109,58 +110,11 @@ class ExternalOrderSnapshot:
     source_status: str
 
 
-WB_STATUS_INT_MAP: dict[int, OrderStatus] = {
-    0: OrderStatus.NEW,
-    1: OrderStatus.ASSEMBLY,
-    2: OrderStatus.TRANSFERRED_TO_DELIVERY,
-    3: OrderStatus.ACCEPTED_AT_WAREHOUSE,
-    4: OrderStatus.IN_TRANSIT_TO_BUYER,
-    5: OrderStatus.ARRIVED_AT_BUYER_PICKUP,
-    6: OrderStatus.BUYOUT,
-    7: OrderStatus.RETURN_STARTED,
-    8: OrderStatus.REJECTION,
-    9: OrderStatus.DEFECT,
-    10: OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER,
-    11: OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP,
-    12: OrderStatus.SELLER_PICKED_UP,
-}
-
-WB_STATUS_TEXT_MAP: dict[str, OrderStatus] = {
+WB_SUPPLIER_STATUS_MAP: dict[str, OrderStatus] = {
     "new": OrderStatus.NEW,
-    "created": OrderStatus.NEW,
     "confirm": OrderStatus.NEW,
-    "awaiting_confirm": OrderStatus.NEW,
-    "assembly": OrderStatus.ASSEMBLY,
-    "assembling": OrderStatus.ASSEMBLY,
-    "awaiting_packaging": OrderStatus.ASSEMBLY,
-    "pack": OrderStatus.ASSEMBLY,
-    "packed": OrderStatus.ASSEMBLY,
-    "transferred_to_delivery": OrderStatus.TRANSFERRED_TO_DELIVERY,
-    "to_delivery": OrderStatus.TRANSFERRED_TO_DELIVERY,
-    "awaiting_deliver": OrderStatus.TRANSFERRED_TO_DELIVERY,
-    "accepted_at_warehouse": OrderStatus.ACCEPTED_AT_WAREHOUSE,
-    "accepted": OrderStatus.ACCEPTED_AT_WAREHOUSE,
-    "in_transit_to_buyer": OrderStatus.IN_TRANSIT_TO_BUYER,
-    "delivering": OrderStatus.IN_TRANSIT_TO_BUYER,
-    "in_transit": OrderStatus.IN_TRANSIT_TO_BUYER,
-    "arrived_at_pickup_point": OrderStatus.ARRIVED_AT_BUYER_PICKUP,
-    "arrived_at_buyer_pickup": OrderStatus.ARRIVED_AT_BUYER_PICKUP,
-    "ready_for_pickup": OrderStatus.ARRIVED_AT_BUYER_PICKUP,
-    "buyout": OrderStatus.BUYOUT,
-    "purchased": OrderStatus.BUYOUT,
-    "picked_up": OrderStatus.BUYOUT,
-    "return": OrderStatus.RETURN_STARTED,
-    "return_started": OrderStatus.RETURN_STARTED,
-    "cancelled": OrderStatus.REJECTION,
-    "canceled": OrderStatus.REJECTION,
-    "rejected": OrderStatus.REJECTION,
-    "defect": OrderStatus.DEFECT,
-    "broken": OrderStatus.DEFECT,
-    "return_in_transit": OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER,
-    "return_in_transit_from_buyer": OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER,
-    "return_arrived": OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP,
-    "return_arrived_to_seller_pickup": OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP,
-    "seller_picked_up": OrderStatus.SELLER_PICKED_UP,
+    "complete": OrderStatus.BUYOUT,
+    "cancel": OrderStatus.REJECTION,
 }
 
 OZON_STATUS_MAP: dict[str, OrderStatus] = {
@@ -270,28 +224,18 @@ def _normalize_status_text(raw_status: str | int | None) -> str:
     return str(raw_status).strip().lower()
 
 
-def _map_wb_status(raw_status: str | int | None) -> OrderStatus:
-    if isinstance(raw_status, int):
-        return WB_STATUS_INT_MAP.get(raw_status, OrderStatus.NEW)
+def _recent_period_utc(days: int = RECENT_ORDERS_DAYS) -> tuple[datetime, datetime]:
+    now = datetime.now(timezone.utc)
+    return now - timedelta(days=days), now
 
+
+def _to_iso8601_utc(value: datetime) -> str:
+    return _to_aware_utc(value).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _map_wb_status(raw_status: str | int | None) -> OrderStatus:
     normalized = _normalize_status_text(raw_status)
-    if normalized.isdigit():
-        return WB_STATUS_INT_MAP.get(int(normalized), OrderStatus.NEW)
-    if normalized in WB_STATUS_TEXT_MAP:
-        return WB_STATUS_TEXT_MAP[normalized]
-    if "cancel" in normalized or "reject" in normalized:
-        return OrderStatus.REJECTION
-    if "return" in normalized and "transit" in normalized:
-        return OrderStatus.RETURN_IN_TRANSIT_FROM_BUYER
-    if "return" in normalized:
-        return OrderStatus.RETURN_STARTED
-    if "delivery" in normalized or "transit" in normalized:
-        return OrderStatus.IN_TRANSIT_TO_BUYER
-    if "warehouse" in normalized:
-        return OrderStatus.ACCEPTED_AT_WAREHOUSE
-    if "pickup" in normalized:
-        return OrderStatus.ARRIVED_AT_BUYER_PICKUP
-    return OrderStatus.NEW
+    return WB_SUPPLIER_STATUS_MAP.get(normalized, OrderStatus.NEW)
 
 
 def _map_ozon_status(raw_status: str | int | None) -> OrderStatus:
@@ -547,8 +491,9 @@ def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
     if not task_number:
         return None
 
-    raw_status = item.get("supplierStatus") or item.get("status") or item.get("wbStatus")
-    status = _map_wb_status(raw_status)
+    raw_supplier_status = item.get("supplierStatus")
+    logger.info("WB supplierStatus: order=%s supplierStatus=%r", task_number, raw_supplier_status)
+    status = _map_wb_status(raw_supplier_status)
     status_at = _parse_datetime(
         item.get("updatedAt")
         or item.get("statusUpdatedAt")
@@ -579,8 +524,16 @@ def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
         sku=sku[:128] if sku else None,
         quantity=_safe_int(item.get("quantity"), default=1),
         due_ship_at=due_ship_at,
-        source_status=str(raw_status or ""),
+        source_status=str(raw_supplier_status or ""),
     )
+
+
+def _log_ozon_postings_preview(postings: list[dict[str, Any]]) -> None:
+    preview: list[dict[str, str]] = []
+    for item in postings[:3]:
+        posting_id = item.get("posting_number") or item.get("order_number") or item.get("order_id") or item.get("id")
+        preview.append({"id": str(posting_id or ""), "status": str(item.get("status") or "")})
+    logger.info("Ozon API первые 3 заказа (id/статус): %s", preview)
 
 
 def _normalize_ozon_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
@@ -624,7 +577,16 @@ def _normalize_ozon_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
 async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
     headers = {"Authorization": wb_token.strip()}
     snapshots: list[ExternalOrderSnapshot] = []
-    next_cursor: int | str = 0
+    recent_from, _ = _recent_period_utc()
+    date_from_unix = int(recent_from.timestamp())
+    next_cursor: int | str | None = None
+
+    logger.info(
+        "WB синхронизация за последние %s дней: dateFrom=%s (%s)",
+        RECENT_ORDERS_DAYS,
+        date_from_unix,
+        _to_iso8601_utc(recent_from),
+    )
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(WB_NEW_ORDERS_URL, headers=headers)
@@ -648,11 +610,20 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
 
         for item in _extract_wb_orders(initial_payload):
             normalized = _normalize_wb_order(item)
-            if normalized:
+            if normalized and normalized.status_at >= recent_from:
                 snapshots.append(normalized)
+            elif normalized:
+                logger.info(
+                    "WB заказ пропущен (старше %s дней): id=%s status_at=%s",
+                    RECENT_ORDERS_DAYS,
+                    normalized.assembly_task_number,
+                    _to_iso8601_utc(normalized.status_at),
+                )
 
         for _ in range(MAX_WB_PAGES):
-            params: dict[str, Any] = {"limit": 1000, "next": next_cursor}
+            params: dict[str, Any] = {"dateFrom": date_from_unix, "limit": 1000}
+            if next_cursor not in (None, "", 0):
+                params["next"] = next_cursor
 
             response = await client.get(WB_ORDERS_URL, headers=headers, params=params)
             _log_marketplace_response("WB", response)
@@ -660,7 +631,12 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
                 payload: Any = response.json()
             except ValueError:
                 payload = response.text
-            logger.info("WB API /orders JSON[next=%s][0:500]=%s", next_cursor, _payload_preview(payload))
+            logger.info(
+                "WB API /orders JSON[dateFrom=%s,next=%s][0:500]=%s",
+                date_from_unix,
+                next_cursor,
+                _payload_preview(payload),
+            )
             if response.status_code == 429:
                 logger.warning("WB API вернул 429, ожидание перед повтором страницы")
                 await asyncio.sleep(2.0)
@@ -673,8 +649,15 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
 
             for item in orders_payload:
                 normalized = _normalize_wb_order(item)
-                if normalized:
+                if normalized and normalized.status_at >= recent_from:
                     snapshots.append(normalized)
+                elif normalized:
+                    logger.info(
+                        "WB заказ пропущен (старше %s дней): id=%s status_at=%s",
+                        RECENT_ORDERS_DAYS,
+                        normalized.assembly_task_number,
+                        _to_iso8601_utc(normalized.status_at),
+                    )
 
             new_next = payload.get("next") if isinstance(payload, dict) else None
             if new_next in (None, "", 0) or new_next == next_cursor:
@@ -692,13 +675,26 @@ async def _fetch_ozon_orders(ozon_client_id: str, ozon_api_key: str) -> list[Ext
     }
     snapshots: list[ExternalOrderSnapshot] = []
     offset = 0
-    limit = 1000
+    limit = 50
+    since_dt, to_dt = _recent_period_utc()
+    since_iso = _to_iso8601_utc(since_dt)
+    to_iso = _to_iso8601_utc(to_dt)
+
+    logger.info(
+        "Ozon синхронизация за последние %s дней: since=%s to=%s",
+        RECENT_ORDERS_DAYS,
+        since_iso,
+        to_iso,
+    )
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         for _ in range(MAX_OZON_PAGES):
             body = {
                 "dir": "ASC",
-                "filter": {"status": ""},
+                "filter": {
+                    "since": since_iso,
+                    "to": to_iso,
+                },
                 "limit": limit,
                 "offset": offset,
                 "with": {
@@ -721,11 +717,13 @@ async def _fetch_ozon_orders(ozon_client_id: str, ozon_api_key: str) -> list[Ext
             if not isinstance(postings, list):
                 break
 
-            for item in postings:
-                if isinstance(item, dict):
-                    normalized = _normalize_ozon_order(item)
-                    if normalized:
-                        snapshots.append(normalized)
+            postings_dicts = [item for item in postings if isinstance(item, dict)]
+            _log_ozon_postings_preview(postings_dicts)
+
+            for item in postings_dicts:
+                normalized = _normalize_ozon_order(item)
+                if normalized:
+                    snapshots.append(normalized)
 
             has_next = bool(result.get("has_next"))
             if not has_next or not postings:

@@ -6,16 +6,18 @@ from pathlib import Path
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
 from sqlalchemy.orm import Session
 
+from app.auth import extract_telegram_id_from_init_data
 from app.config import settings
-from app.db import get_session, init_db
+from app.db import get_session, init_db, session_scope
 from app.enums import Marketplace
+from app.models import User
 from app.schemas import (
     DashboardSummary,
     OrdersResponse,
@@ -26,7 +28,9 @@ from app.schemas import (
 )
 from app.services import (
     build_summary,
+    ensure_owner_user,
     export_rows,
+    get_user_by_telegram_id,
     get_settings,
     list_orders,
     marketplace_catalog,
@@ -53,6 +57,43 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 bot_instance = None
 dp_instance = None
 scheduler: AsyncIOScheduler | None = None
+
+
+def _extract_init_data(request: Request) -> str:
+    return (
+        request.headers.get("X-Telegram-Init-Data")
+        or request.query_params.get("init_data")
+        or request.query_params.get("tgWebAppData")
+        or ""
+    )
+
+
+def get_authorized_webapp_user(
+    request: Request,
+    session: Session = Depends(get_session),
+) -> User:
+    init_data = _extract_init_data(request)
+    if not init_data:
+        raise HTTPException(
+            status_code=401,
+            detail="Требуется авторизация Telegram WebApp",
+        )
+
+    try:
+        telegram_id = extract_telegram_id_from_init_data(init_data, settings.bot_token)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Ошибка авторизации Telegram WebApp: {exc}",
+        ) from exc
+
+    user = get_user_by_telegram_id(session, telegram_id)
+    if not user:
+        raise HTTPException(
+            status_code=403,
+            detail="У вас нет доступа. Обратитесь к руководителю.",
+        )
+    return user
 
 
 async def _scheduled_sync_job() -> None:
@@ -88,6 +129,8 @@ def _start_scheduler() -> None:
 async def startup_event() -> None:
     global bot_instance, dp_instance
     init_db()
+    with session_scope() as session:
+        ensure_owner_user(session)
     _start_scheduler()
 
     if settings.bot_token and settings.webapp_url:
@@ -126,17 +169,17 @@ def health_check() -> dict[str, str]:
 
 
 @app.get("/")
-def serve_web_app() -> FileResponse:
+def serve_web_app(_: User = Depends(get_authorized_webapp_user)) -> FileResponse:
     return FileResponse(static_dir / "index.html")
 
 
 @app.get("/api/meta/statuses", response_model=list[StatusCatalogItem])
-def get_statuses() -> list[StatusCatalogItem]:
+def get_statuses(_: User = Depends(get_authorized_webapp_user)) -> list[StatusCatalogItem]:
     return status_catalog()
 
 
 @app.get("/api/meta/marketplaces")
-def get_marketplaces() -> list[dict[str, str]]:
+def get_marketplaces(_: User = Depends(get_authorized_webapp_user)) -> list[dict[str, str]]:
     return marketplace_catalog()
 
 
@@ -147,6 +190,7 @@ def list_orders_endpoint(
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_session),
+    _: User = Depends(get_authorized_webapp_user),
 ) -> OrdersResponse:
     items, total = list_orders(
         session=session,
@@ -160,33 +204,48 @@ def list_orders_endpoint(
 
 @app.get("/api/dashboard/{marketplace}", response_model=DashboardSummary)
 def dashboard_marketplace_endpoint(
-    marketplace: Marketplace, session: Session = Depends(get_session)
+    marketplace: Marketplace,
+    session: Session = Depends(get_session),
+    _: User = Depends(get_authorized_webapp_user),
 ) -> DashboardSummary:
     return build_summary(session, marketplace)
 
 
 @app.get("/api/dashboard")
-def dashboard_all_endpoint(session: Session = Depends(get_session)) -> list[DashboardSummary]:
+def dashboard_all_endpoint(
+    session: Session = Depends(get_session),
+    _: User = Depends(get_authorized_webapp_user),
+) -> list[DashboardSummary]:
     return [build_summary(session, marketplace) for marketplace in Marketplace]
 
 
 @app.get("/api/settings", response_model=SettingsRead)
-def settings_read_endpoint(session: Session = Depends(get_session)) -> SettingsRead:
+def settings_read_endpoint(
+    session: Session = Depends(get_session),
+    _: User = Depends(get_authorized_webapp_user),
+) -> SettingsRead:
     return get_settings(session)
 
 
 @app.put("/api/settings", response_model=SettingsRead)
-def settings_update_endpoint(payload: SettingsUpdate, session: Session = Depends(get_session)) -> SettingsRead:
+def settings_update_endpoint(
+    payload: SettingsUpdate,
+    session: Session = Depends(get_session),
+    _: User = Depends(get_authorized_webapp_user),
+) -> SettingsRead:
     return save_settings(session, payload)
 
 
 @app.post("/api/sync/run", response_model=SyncReport)
-async def run_sync_endpoint() -> SyncReport:
+async def run_sync_endpoint(_: User = Depends(get_authorized_webapp_user)) -> SyncReport:
     return await sync_orders_from_marketplaces()
 
 
 @app.get("/api/export/orders.csv")
-def export_orders_csv_endpoint(session: Session = Depends(get_session)) -> StreamingResponse:
+def export_orders_csv_endpoint(
+    session: Session = Depends(get_session),
+    _: User = Depends(get_authorized_webapp_user),
+) -> StreamingResponse:
     rows = export_rows(session)
     columns = [
         "Маркетплейс",
@@ -211,7 +270,10 @@ def export_orders_csv_endpoint(session: Session = Depends(get_session)) -> Strea
 
 
 @app.get("/api/export/orders.xlsx")
-def export_orders_xlsx_endpoint(session: Session = Depends(get_session)) -> StreamingResponse:
+def export_orders_xlsx_endpoint(
+    session: Session = Depends(get_session),
+    _: User = Depends(get_authorized_webapp_user),
+) -> StreamingResponse:
     rows = export_rows(session)
     columns = [
         "Маркетплейс",

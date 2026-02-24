@@ -5,7 +5,7 @@ from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
-from app.enums import Marketplace, OrderStatus
+from app.enums import Marketplace, OrderStatus, UserRole
 
 
 class Order(Base):
@@ -79,4 +79,19 @@ class Settings(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (
+        Index("ix_users_role", "role"),
+    )
+
+    telegram_id: Mapped[int] = mapped_column(primary_key=True, unique=True, nullable=False)
+    role: Mapped[UserRole] = mapped_column(SAEnum(UserRole), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    added_by: Mapped[int] = mapped_column(nullable=False)
 

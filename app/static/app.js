@@ -1,6 +1,7 @@
 const state = {
   currentMarketplace: "wb",
   currentPage: "dashboard",
+  initData: "",
 };
 
 const summaryCards = document.getElementById("summaryCards");
@@ -28,10 +29,36 @@ const STATUS_SEVERITY = {
 
 let searchDebounce = null;
 
+function getTelegramInitDataFromQuery() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("tgWebAppData") || params.get("init_data") || "";
+}
+
+function setupTelegramWebApp() {
+  const telegramWebApp = window.Telegram?.WebApp;
+  const initDataFromQuery = getTelegramInitDataFromQuery();
+
+  if (!telegramWebApp) {
+    state.initData = initDataFromQuery;
+    return;
+  }
+
+  telegramWebApp.ready();
+  telegramWebApp.expand();
+  state.initData = telegramWebApp.initData || initDataFromQuery;
+}
+
 async function api(path, options = {}) {
+  if (!state.initData) {
+    throw new Error(
+      "Не удалось получить авторизацию Telegram. Откройте дашборд через кнопку «Открыть дашборд» в боте."
+    );
+  }
+
   const response = await fetch(path, {
     headers: {
       "Content-Type": "application/json",
+      "X-Telegram-Init-Data": state.initData,
       ...(options.headers || {}),
     },
     ...options,
@@ -177,12 +204,44 @@ async function runSync() {
   }
 }
 
-function exportCsv() {
-  window.location.href = "/api/export/orders.csv";
+async function downloadFile(path, fallbackFilename) {
+  if (!state.initData) {
+    throw new Error(
+      "Не удалось получить авторизацию Telegram. Откройте дашборд через кнопку «Открыть дашборд» в боте."
+    );
+  }
+
+  const response = await fetch(path, {
+    method: "GET",
+    headers: {
+      "X-Telegram-Init-Data": state.initData,
+    },
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.detail || "Ошибка загрузки файла");
+  }
+
+  const contentDisposition = response.headers.get("Content-Disposition") || "";
+  const fileNameMatch = contentDisposition.match(/filename="?([^"]+)"?/i);
+  const fileName = fileNameMatch?.[1] || fallbackFilename;
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
-function exportXlsx() {
-  window.location.href = "/api/export/orders.xlsx";
+async function exportCsv() {
+  await downloadFile("/api/export/orders.csv", "orders_export.csv");
+}
+
+async function exportXlsx() {
+  await downloadFile("/api/export/orders.xlsx", "orders_export.xlsx");
 }
 
 async function reloadDashboard() {
@@ -226,11 +285,21 @@ function bindEvents() {
     saveSettings().catch((error) => alert(error.message));
   });
 
-  exportCsvBtn.addEventListener("click", exportCsv);
-  exportXlsxBtn.addEventListener("click", exportXlsx);
+  exportCsvBtn.addEventListener("click", () => {
+    exportCsv().catch((error) => alert(error.message));
+  });
+  exportXlsxBtn.addEventListener("click", () => {
+    exportXlsx().catch((error) => alert(error.message));
+  });
 }
 
 async function bootstrap() {
+  setupTelegramWebApp();
+  if (!state.initData) {
+    throw new Error(
+      "Доступ запрещён. Откройте дашборд через кнопку «Открыть дашборд» в Telegram-боте."
+    );
+  }
   setMarketplace("wb");
   setPage("dashboard");
   bindEvents();

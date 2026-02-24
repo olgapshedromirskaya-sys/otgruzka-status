@@ -112,10 +112,34 @@ class ExternalOrderSnapshot:
 
 WB_SUPPLIER_STATUS_MAP: dict[str, OrderStatus] = {
     "new": OrderStatus.NEW,
-    "confirm": OrderStatus.NEW,
+    "confirm": OrderStatus.ASSEMBLY,
     "complete": OrderStatus.BUYOUT,
     "cancel": OrderStatus.REJECTION,
 }
+
+WB_STATUS_MAP: dict[str, OrderStatus] = {
+    "waiting": OrderStatus.NEW,
+    "sorted": OrderStatus.ASSEMBLY,
+    "ready_for_pickup": OrderStatus.ARRIVED_AT_BUYER_PICKUP,
+    "accepted_by_carrier": OrderStatus.ACCEPTED_AT_WAREHOUSE,
+    "sent_to_carrier": OrderStatus.IN_TRANSIT_TO_BUYER,
+    "sold": OrderStatus.BUYOUT,
+    "canceled": OrderStatus.REJECTION,
+    "canceled_by_client": OrderStatus.REJECTION,
+    "declined_by_client": OrderStatus.REJECTION,
+    "defect": OrderStatus.DEFECT,
+}
+
+WB_FORWARD_FUNNEL: tuple[OrderStatus, ...] = (
+    OrderStatus.NEW,
+    OrderStatus.ASSEMBLY,
+    OrderStatus.TRANSFERRED_TO_DELIVERY,
+    OrderStatus.ACCEPTED_AT_WAREHOUSE,
+    OrderStatus.IN_TRANSIT_TO_BUYER,
+    OrderStatus.ARRIVED_AT_BUYER_PICKUP,
+    OrderStatus.BUYOUT,
+)
+WB_FORWARD_FUNNEL_INDEX = {status: idx for idx, status in enumerate(WB_FORWARD_FUNNEL)}
 
 OZON_STATUS_MAP: dict[str, OrderStatus] = {
     "awaiting_registration": OrderStatus.NEW,
@@ -233,9 +257,46 @@ def _to_iso8601_utc(value: datetime) -> str:
     return _to_aware_utc(value).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _map_wb_status(raw_status: str | int | None) -> OrderStatus:
-    normalized = _normalize_status_text(raw_status)
-    return WB_SUPPLIER_STATUS_MAP.get(normalized, OrderStatus.NEW)
+def _has_wb_supply_id(raw_supply_id: Any) -> bool:
+    if raw_supply_id is None:
+        return False
+    if isinstance(raw_supply_id, str):
+        return bool(raw_supply_id.strip())
+    if isinstance(raw_supply_id, (int, float)):
+        return raw_supply_id > 0
+    return bool(raw_supply_id)
+
+
+def _map_wb_status(
+    raw_supplier_status: str | int | None,
+    raw_wb_status: str | int | None,
+    *,
+    has_supply_id: bool,
+) -> OrderStatus:
+    supplier_status = _normalize_status_text(raw_supplier_status)
+    wb_status = _normalize_status_text(raw_wb_status)
+
+    status = WB_SUPPLIER_STATUS_MAP.get(supplier_status, OrderStatus.NEW)
+    if supplier_status in {"confirm", "complete"} and wb_status in WB_STATUS_MAP:
+        status = WB_STATUS_MAP[wb_status]
+
+    if supplier_status == "confirm" and has_supply_id:
+        in_delivery_rank = WB_FORWARD_FUNNEL_INDEX[OrderStatus.TRANSFERRED_TO_DELIVERY]
+        mapped_rank = WB_FORWARD_FUNNEL_INDEX.get(status)
+        if mapped_rank is None or mapped_rank < in_delivery_rank:
+            status = OrderStatus.TRANSFERRED_TO_DELIVERY
+
+    return status
+
+
+def _prevent_wb_status_rollback(current_status: OrderStatus, incoming_status: OrderStatus) -> OrderStatus:
+    current_rank = WB_FORWARD_FUNNEL_INDEX.get(current_status)
+    incoming_rank = WB_FORWARD_FUNNEL_INDEX.get(incoming_status)
+    if current_rank is None or incoming_rank is None:
+        return incoming_status
+    if incoming_rank < current_rank:
+        return current_status
+    return incoming_status
 
 
 def _map_ozon_status(raw_status: str | int | None) -> OrderStatus:
@@ -397,7 +458,7 @@ def build_summary(session: Session, marketplace: Marketplace) -> DashboardSummar
         session.scalar(
             select(func.count(Order.id)).where(
                 market_filter,
-                Order.current_status_at >= today_start,
+                Order.updated_at >= today_start,
             )
         )
         or 0
@@ -430,7 +491,7 @@ def build_today_summary(session: Session) -> TodaySummary:
         session.scalar(
             select(func.count(Order.id)).where(
                 Order.marketplace == Marketplace.WB,
-                Order.current_status_at >= today_start,
+                Order.updated_at >= today_start,
             )
         )
         or 0
@@ -439,7 +500,7 @@ def build_today_summary(session: Session) -> TodaySummary:
         session.scalar(
             select(func.count(Order.id)).where(
                 Order.marketplace == Marketplace.OZON,
-                Order.current_status_at >= today_start,
+                Order.updated_at >= today_start,
             )
         )
         or 0
@@ -492,8 +553,17 @@ def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
         return None
 
     raw_supplier_status = item.get("supplierStatus")
-    logger.info("WB supplierStatus: order=%s supplierStatus=%r", task_number, raw_supplier_status)
-    status = _map_wb_status(raw_supplier_status)
+    raw_wb_status = item.get("wbStatus", item.get("wb_status"))
+    raw_supply_id = item.get("supplyId", item.get("supply_id"))
+    has_supply_id = _has_wb_supply_id(raw_supply_id)
+    logger.info(
+        "WB status source: order=%s supplierStatus=%r wbStatus=%r supplyId=%r",
+        task_number,
+        raw_supplier_status,
+        raw_wb_status,
+        raw_supply_id,
+    )
+    status = _map_wb_status(raw_supplier_status, raw_wb_status, has_supply_id=has_supply_id)
     status_at = _parse_datetime(
         item.get("updatedAt")
         or item.get("statusUpdatedAt")
@@ -524,7 +594,11 @@ def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
         sku=sku[:128] if sku else None,
         quantity=_safe_int(item.get("quantity"), default=1),
         due_ship_at=due_ship_at,
-        source_status=str(raw_supplier_status or ""),
+        source_status=(
+            f"supplierStatus={raw_supplier_status or ''}; "
+            f"wbStatus={raw_wb_status or ''}; "
+            f"supplyId={raw_supply_id or ''}"
+        ),
     )
 
 
@@ -798,24 +872,40 @@ def _upsert_snapshot(session: Session, snapshot: ExternalOrderSnapshot) -> tuple
     order.quantity = max(snapshot.quantity, 1)
     order.due_ship_at = snapshot.due_ship_at or order.due_ship_at
 
-    should_create_event = False
-    if order.current_status != snapshot.status:
-        should_create_event = True
-    elif snapshot.status_at > _to_aware_utc(order.current_status_at) + timedelta(seconds=1):
-        should_create_event = True
+    next_status = snapshot.status
+    rollback_blocked = False
+    if snapshot.marketplace == Marketplace.WB:
+        protected_status = _prevent_wb_status_rollback(order.current_status, snapshot.status)
+        rollback_blocked = protected_status != snapshot.status
+        next_status = protected_status
+        if rollback_blocked:
+            logger.info(
+                "WB rollback prevented: order=%s current=%s incoming=%s",
+                order.external_order_id,
+                order.current_status.value,
+                snapshot.status.value,
+            )
 
-    if should_create_event and not _is_duplicate_event(order, snapshot.status, snapshot.status_at):
+    should_create_event = False
+    if not rollback_blocked:
+        if order.current_status != next_status:
+            should_create_event = True
+        elif snapshot.status_at > _to_aware_utc(order.current_status_at) + timedelta(seconds=1):
+            should_create_event = True
+
+    if should_create_event and not _is_duplicate_event(order, next_status, snapshot.status_at):
         order.events.append(
             OrderEvent(
-                status=snapshot.status,
+                status=next_status,
                 event_at=snapshot.status_at,
                 note=_event_note(snapshot.source_status),
             )
         )
-        order.current_status = snapshot.status
+        order.current_status = next_status
         order.current_status_at = snapshot.status_at
+        order.updated_at = datetime.now(timezone.utc)
         event_created = True
-    elif snapshot.status_at > _to_aware_utc(order.current_status_at):
+    elif not rollback_blocked and snapshot.status_at > _to_aware_utc(order.current_status_at):
         order.current_status_at = snapshot.status_at
 
     session.add(order)

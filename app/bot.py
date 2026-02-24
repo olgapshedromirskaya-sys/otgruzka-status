@@ -1,9 +1,21 @@
 from datetime import datetime
+from html import escape
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, WebAppInfo
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    WebAppInfo,
+)
 
 from app.config import settings
 from app.db import session_scope
@@ -23,6 +35,14 @@ router = Router()
 
 ACCESS_DENIED_TEXT = "У вас нет доступа. Обратитесь к руководителю."
 OWNER_ONLY_TEXT = "Команда доступна только руководителю."
+ADD_EMPLOYEE_ROLE_ADMIN = "add_employee_role:admin"
+DELETE_USER_PREFIX = "delete_user:"
+
+
+class AddEmployeeStates(StatesGroup):
+    waiting_telegram_id = State()
+    waiting_full_name = State()
+    waiting_role = State()
 
 
 def get_bot() -> Bot:
@@ -33,7 +53,7 @@ def get_bot() -> Bot:
 
 
 def get_dispatcher() -> Dispatcher:
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     return dp
 
@@ -50,7 +70,7 @@ def _build_keyboard(role: UserRole) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="Настройки")],
     ]
     if role == UserRole.OWNER:
-        keyboard.append([KeyboardButton(text="/users")])
+        keyboard.append([KeyboardButton(text="👥 Добавить сотрудника"), KeyboardButton(text="👥 Сотрудники")])
 
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
@@ -75,6 +95,64 @@ async def _require_user(message: Message, owner_only: bool = False) -> User | No
         return None
 
     return user
+
+
+def _build_add_employee_role_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👔 Администратор",
+                    callback_data=ADD_EMPLOYEE_ROLE_ADMIN,
+                )
+            ]
+        ]
+    )
+
+
+def _build_user_delete_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Удалить",
+                    callback_data=f"{DELETE_USER_PREFIX}{telegram_id}",
+                )
+            ]
+        ]
+    )
+
+
+def _format_user_card(user: User) -> str:
+    added_at = user.added_at
+    added_at_text = added_at.strftime("%d.%m.%Y %H:%M") if isinstance(added_at, datetime) else "—"
+    added_by_text = f"{user.added_by}" if user.added_by is not None else "система"
+    text = (
+        f"<b>{escape(user.full_name)}</b>\n"
+        f"Роль: {USER_ROLE_LABELS[user.role]}\n"
+        f"Telegram ID: <code>{user.telegram_id}</code>\n"
+        f"Добавлен: {added_at_text}\n"
+        f"Кем добавлен: {added_by_text}"
+    )
+    if user.role == UserRole.OWNER:
+        text += "\nУдаление недоступно для руководителя."
+    return text
+
+
+async def _send_users_with_actions(message: Message) -> None:
+    with session_scope() as session:
+        users = list_users(session)
+
+    if not users:
+        await message.answer("Список пользователей пуст.")
+        return
+
+    await message.answer("<b>Сотрудники:</b>")
+    for user in users:
+        reply_markup = None
+        if user.role != UserRole.OWNER:
+            reply_markup = _build_user_delete_keyboard(user.telegram_id)
+        await message.answer(_format_user_card(user), reply_markup=reply_markup)
 
 
 def _orders_text(marketplace: Marketplace) -> str:
@@ -134,13 +212,18 @@ def _help_text(role: UserRole) -> str:
                 "/addadmin [telegram_id] [имя] — добавить администратора",
                 "/removeuser [telegram_id] — удалить пользователя",
                 "/users — список пользователей",
+                "",
+                "Кнопки руководителя:",
+                "👥 Добавить сотрудника — пошаговое добавление через диалог",
+                "👥 Сотрудники — список пользователей с кнопками удаления",
             ]
         )
     return "\n".join(lines)
 
 
 @router.message(CommandStart())
-async def start_handler(message: Message) -> None:
+async def start_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
     user = await _require_user(message)
     if not user:
         return
@@ -151,9 +234,7 @@ async def start_handler(message: Message) -> None:
         "Используйте кнопки ниже для просмотра заказов, сводки и WebApp.",
     ]
     if user.role == UserRole.OWNER:
-        lines.append(
-            "Команды руководителя: /addadmin [telegram_id] [имя], /removeuser [telegram_id], /users."
-        )
+        lines.append("Для управления доступом используйте кнопки «👥 Добавить сотрудника» и «👥 Сотрудники».")
 
     await message.answer(
         "\n".join(lines),
@@ -162,7 +243,8 @@ async def start_handler(message: Message) -> None:
 
 
 @router.message(Command("help"))
-async def help_handler(message: Message) -> None:
+async def help_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
     user = await _require_user(message)
     if not user:
         return
@@ -170,6 +252,148 @@ async def help_handler(message: Message) -> None:
         _help_text(user.role),
         reply_markup=_build_keyboard(user.role),
     )
+
+
+@router.message(F.text == "👥 Добавить сотрудника")
+async def add_employee_dialog_start_handler(message: Message, state: FSMContext) -> None:
+    owner = await _require_user(message, owner_only=True)
+    if not owner:
+        return
+
+    await state.clear()
+    await state.set_state(AddEmployeeStates.waiting_telegram_id)
+    await message.answer("Введите Telegram ID сотрудника:")
+
+
+@router.message(AddEmployeeStates.waiting_telegram_id)
+async def add_employee_collect_telegram_id_handler(message: Message, state: FSMContext) -> None:
+    owner = await _require_user(message, owner_only=True)
+    if not owner:
+        await state.clear()
+        return
+
+    telegram_id_raw = (message.text or "").strip()
+    try:
+        telegram_id = int(telegram_id_raw)
+    except ValueError:
+        await message.answer("Telegram ID должен быть целым числом. Введите Telegram ID сотрудника:")
+        return
+    if telegram_id <= 0:
+        await message.answer("Telegram ID должен быть положительным числом. Введите Telegram ID сотрудника:")
+        return
+
+    with session_scope() as session:
+        exists = get_user_by_telegram_id(session, telegram_id)
+    if exists:
+        await message.answer("Пользователь с таким Telegram ID уже существует. Введите другой Telegram ID:")
+        return
+
+    await state.update_data(telegram_id=telegram_id)
+    await state.set_state(AddEmployeeStates.waiting_full_name)
+    await message.answer("Введите имя сотрудника:")
+
+
+@router.message(AddEmployeeStates.waiting_full_name)
+async def add_employee_collect_full_name_handler(message: Message, state: FSMContext) -> None:
+    owner = await _require_user(message, owner_only=True)
+    if not owner:
+        await state.clear()
+        return
+
+    full_name = (message.text or "").strip()
+    if not full_name:
+        await message.answer("Имя не может быть пустым. Введите имя сотрудника:")
+        return
+    if len(full_name) > 256:
+        await message.answer("Имя слишком длинное. Максимум 256 символов. Введите имя сотрудника:")
+        return
+
+    await state.update_data(full_name=full_name)
+    await state.set_state(AddEmployeeStates.waiting_role)
+    await message.answer(
+        "Выберите роль сотрудника:",
+        reply_markup=_build_add_employee_role_keyboard(),
+    )
+
+
+@router.message(AddEmployeeStates.waiting_role)
+async def add_employee_waiting_role_message_handler(message: Message) -> None:
+    owner = await _require_user(message, owner_only=True)
+    if not owner:
+        return
+    await message.answer(
+        "Нажмите кнопку «👔 Администратор», чтобы завершить добавление сотрудника.",
+        reply_markup=_build_add_employee_role_keyboard(),
+    )
+
+
+@router.callback_query(AddEmployeeStates.waiting_role, F.data == ADD_EMPLOYEE_ROLE_ADMIN)
+async def add_employee_select_role_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        await callback.answer("Не удалось определить Telegram ID пользователя.", show_alert=True)
+        await state.clear()
+        return
+
+    with session_scope() as session:
+        owner = get_user_by_telegram_id(session, callback.from_user.id)
+    if not owner:
+        await callback.answer(ACCESS_DENIED_TEXT, show_alert=True)
+        await state.clear()
+        return
+    if owner.role != UserRole.OWNER:
+        await callback.answer(OWNER_ONLY_TEXT, show_alert=True)
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    telegram_id = data.get("telegram_id")
+    full_name = str(data.get("full_name", "")).strip()
+    if not isinstance(telegram_id, int) or telegram_id <= 0 or not full_name:
+        if callback.message:
+            await callback.message.answer("Диалог добавления сотрудника сброшен. Нажмите «👥 Добавить сотрудника» снова.")
+        await callback.answer()
+        await state.clear()
+        return
+
+    try:
+        with session_scope() as session:
+            add_admin_user(
+                session=session,
+                telegram_id=telegram_id,
+                full_name=full_name,
+                added_by=owner.telegram_id,
+            )
+    except ValueError as exc:
+        if callback.message:
+            await callback.message.answer(str(exc))
+        await callback.answer()
+        await state.clear()
+        return
+
+    if callback.message:
+        await callback.message.answer(
+            f"✅ Сотрудник {escape(full_name)} добавлен с ролью Администратор. "
+            "Пусть напишет /start боту для получения доступа."
+        )
+
+    await callback.answer()
+    await state.clear()
+
+
+@router.callback_query(F.data == ADD_EMPLOYEE_ROLE_ADMIN)
+async def add_employee_role_stale_callback_handler(callback: CallbackQuery) -> None:
+    await callback.answer(
+        "Диалог добавления сотрудника уже завершён. Нажмите «👥 Добавить сотрудника» для нового добавления.",
+        show_alert=True,
+    )
+
+
+@router.message(F.text == "👥 Сотрудники")
+async def users_menu_handler(message: Message) -> None:
+    owner = await _require_user(message, owner_only=True)
+    if not owner:
+        return
+    await _send_users_with_actions(message)
 
 
 @router.message(Command("addadmin"))
@@ -263,30 +487,53 @@ async def users_handler(message: Message) -> None:
     owner = await _require_user(message, owner_only=True)
     if not owner:
         return
+    await _send_users_with_actions(message)
 
-    with session_scope() as session:
-        users = list_users(session)
 
-    if not users:
-        await message.answer("Список пользователей пуст.")
+@router.callback_query(F.data.startswith(DELETE_USER_PREFIX))
+async def delete_user_button_handler(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        await callback.answer("Не удалось определить Telegram ID пользователя.", show_alert=True)
         return
 
-    lines = ["<b>Пользователи:</b>"]
-    for user in users:
-        added_at = user.added_at
-        added_at_text = (
-            added_at.strftime("%d.%m.%Y %H:%M")
-            if isinstance(added_at, datetime)
-            else "—"
-        )
-        added_by_text = f"{user.added_by}" if user.added_by is not None else "система"
-        lines.append(
-            "• "
-            f"<b>{user.full_name}</b> — {USER_ROLE_LABELS[user.role]} "
-            f"(ID: <code>{user.telegram_id}</code>, добавлен: {added_at_text}, кем: {added_by_text})"
-        )
+    with session_scope() as session:
+        owner = get_user_by_telegram_id(session, callback.from_user.id)
+    if not owner:
+        await callback.answer(ACCESS_DENIED_TEXT, show_alert=True)
+        return
+    if owner.role != UserRole.OWNER:
+        await callback.answer(OWNER_ONLY_TEXT, show_alert=True)
+        return
 
-    await message.answer("\n".join(lines))
+    telegram_id_raw = (callback.data or "").removeprefix(DELETE_USER_PREFIX)
+    try:
+        telegram_id = int(telegram_id_raw)
+    except ValueError:
+        await callback.answer("Некорректный Telegram ID для удаления.", show_alert=True)
+        return
+    if telegram_id <= 0:
+        await callback.answer("Некорректный Telegram ID для удаления.", show_alert=True)
+        return
+    if telegram_id == owner.telegram_id:
+        await callback.answer("Нельзя удалить самого себя.", show_alert=True)
+        return
+
+    with session_scope() as session:
+        user = get_user_by_telegram_id(session, telegram_id)
+        if not user:
+            await callback.answer("Пользователь уже удалён или не найден.", show_alert=True)
+            return
+        if user.role == UserRole.OWNER:
+            await callback.answer("Нельзя удалить пользователя с ролью Руководитель.", show_alert=True)
+            return
+        removed_name = user.full_name
+        remove_user(session, telegram_id)
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"✅ Сотрудник {escape(removed_name)} удалён (ID: <code>{telegram_id}</code>)."
+        )
+    await callback.answer("Пользователь удалён.")
 
 
 @router.message(F.text == "Заказы WB")

@@ -1,8 +1,10 @@
 from enum import Enum
 
+
 class Marketplace(str, Enum):
     WB = "wb"
     OZON = "ozon"
+
 
 class OrderStatus(str, Enum):
     NEW = "new"
@@ -18,6 +20,12 @@ class OrderStatus(str, Enum):
     RETURN_IN_TRANSIT_FROM_BUYER = "return_in_transit_from_buyer"
     RETURN_ARRIVED_TO_SELLER_PICKUP = "return_arrived_to_seller_pickup"
     SELLER_PICKED_UP = "seller_picked_up"
+
+
+class UserRole(str, Enum):
+    OWNER = "owner"
+    ADMIN = "admin"
+
 
 MARKETPLACE_LABELS = {
     Marketplace.WB: "Вайлдберриз",
@@ -39,6 +47,13 @@ STATUS_LABELS = {
     OrderStatus.RETURN_ARRIVED_TO_SELLER_PICKUP: "Возврат прибыл на ПВЗ продавца",
     OrderStatus.SELLER_PICKED_UP: "Продавец товар забрал",
 }
+
+
+USER_ROLE_LABELS = {
+    UserRole.OWNER: "Руководитель",
+    UserRole.ADMIN: "Администратор",
+}
+
 
 FINAL_STATUSES = {
     OrderStatus.BUYOUT,

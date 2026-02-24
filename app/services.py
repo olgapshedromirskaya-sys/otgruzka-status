@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings as app_settings
 from app.db import session_scope
-from app.enums import MARKETPLACE_LABELS, STATUS_LABELS, Marketplace, OrderStatus
-from app.models import Order, OrderEvent, Settings
+from app.enums import MARKETPLACE_LABELS, STATUS_LABELS, Marketplace, OrderStatus, UserRole
+from app.models import Order, OrderEvent, Settings, User
 from app.schemas import (
     DashboardSummary,
     OrderBrief,
@@ -33,6 +33,65 @@ MAX_OZON_PAGES = 30
 
 WB_ORDERS_URL = "https://api.wildberries.ru/api/v3/orders"
 OZON_FBS_LIST_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
+
+
+def get_user_by_telegram_id(session: Session, telegram_id: int) -> User | None:
+    return session.get(User, telegram_id)
+
+
+def list_users(session: Session) -> list[User]:
+    items = list(session.scalars(select(User)).all())
+    return sorted(
+        items,
+        key=lambda item: (0 if item.role == UserRole.OWNER else 1, item.added_at, item.telegram_id),
+    )
+
+
+def add_admin_user(session: Session, telegram_id: int, full_name: str, added_by: int) -> User:
+    existing = get_user_by_telegram_id(session, telegram_id)
+    if existing:
+        raise ValueError("Пользователь с таким Telegram ID уже существует")
+
+    user = User(
+        telegram_id=telegram_id,
+        role=UserRole.ADMIN,
+        full_name=full_name.strip(),
+        added_by=added_by,
+    )
+    session.add(user)
+    session.flush()
+    return user
+
+
+def remove_user(session: Session, telegram_id: int) -> User | None:
+    user = get_user_by_telegram_id(session, telegram_id)
+    if not user:
+        return None
+    session.delete(user)
+    session.flush()
+    return user
+
+
+def ensure_owner_user(session: Session) -> bool:
+    users_total = int(session.scalar(select(func.count(User.telegram_id))) or 0)
+    if users_total > 0:
+        return False
+
+    owner_telegram_id = app_settings.owner_telegram_id
+    if owner_telegram_id is None:
+        logger.warning("OWNER_TELEGRAM_ID не задан, owner-пользователь не создан")
+        return False
+
+    owner = User(
+        telegram_id=owner_telegram_id,
+        role=UserRole.OWNER,
+        full_name="Руководитель",
+        added_by=owner_telegram_id,
+    )
+    session.add(owner)
+    session.flush()
+    logger.info("Создан первый owner с Telegram ID %s", owner_telegram_id)
+    return True
 
 
 @dataclass(slots=True)

@@ -1,7 +1,6 @@
 const state = {
   currentMarketplace: "wb",
   currentPage: "dashboard",
-  initData: "",
 };
 
 const summaryCards = document.getElementById("summaryCards");
@@ -29,36 +28,18 @@ const STATUS_SEVERITY = {
 
 let searchDebounce = null;
 
-function getTelegramInitDataFromQuery() {
-  const params = new URLSearchParams(window.location.search);
-  return params.get("tgWebAppData") || params.get("init_data") || "";
-}
-
 function setupTelegramWebApp() {
   const telegramWebApp = window.Telegram?.WebApp;
-  const initDataFromQuery = getTelegramInitDataFromQuery();
-
-  if (!telegramWebApp) {
-    state.initData = initDataFromQuery;
-    return;
-  }
+  if (!telegramWebApp) return;
 
   telegramWebApp.ready();
   telegramWebApp.expand();
-  state.initData = telegramWebApp.initData || initDataFromQuery;
 }
 
 async function api(path, options = {}) {
-  if (!state.initData) {
-    throw new Error(
-      "Не удалось получить авторизацию Telegram. Откройте дашборд через кнопку «Открыть дашборд» в боте."
-    );
-  }
-
   const response = await fetch(path, {
     headers: {
       "Content-Type": "application/json",
-      "X-Telegram-Init-Data": state.initData,
       ...(options.headers || {}),
     },
     ...options,
@@ -205,17 +186,8 @@ async function runSync() {
 }
 
 async function downloadFile(path, fallbackFilename) {
-  if (!state.initData) {
-    throw new Error(
-      "Не удалось получить авторизацию Telegram. Откройте дашборд через кнопку «Открыть дашборд» в боте."
-    );
-  }
-
   const response = await fetch(path, {
     method: "GET",
-    headers: {
-      "X-Telegram-Init-Data": state.initData,
-    },
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
@@ -295,11 +267,6 @@ function bindEvents() {
 
 async function bootstrap() {
   setupTelegramWebApp();
-  if (!state.initData) {
-    throw new Error(
-      "Доступ запрещён. Откройте дашборд через кнопку «Открыть дашборд» в Telegram-боте."
-    );
-  }
   setMarketplace("wb");
   setPage("dashboard");
   bindEvents();

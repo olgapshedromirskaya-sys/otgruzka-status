@@ -549,11 +549,11 @@ def _extract_wb_task_number(item: dict[str, Any]) -> str:
 
 
 def _extract_wb_supplier_status(item: dict[str, Any]) -> Any:
-    return item.get("supplierStatus", item.get("supplier_status"))
+    return item.get("supplierStatus") or item.get("supplier_status")
 
 
 def _extract_wb_status(item: dict[str, Any]) -> Any:
-    return item.get("wbStatus", item.get("wb_status"))
+    return item.get("wbStatus") or item.get("wb_status")
 
 
 def _append_wb_status_preview_items(

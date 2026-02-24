@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -234,6 +235,18 @@ def _log_marketplace_response(api_name: str, response: httpx.Response) -> None:
             response.status_code,
             body_preview,
         )
+
+
+def _payload_preview(payload: Any, limit: int = 500) -> str:
+    try:
+        serialized = json.dumps(payload, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        serialized = str(payload)
+
+    preview = serialized[:limit].replace("\n", "\\n")
+    if len(serialized) > limit:
+        return f"{preview}..."
+    return preview
 
 
 def _extract_wb_orders(payload: Any) -> list[dict[str, Any]]:
@@ -616,14 +629,24 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(WB_NEW_ORDERS_URL, headers=headers)
         _log_marketplace_response("WB", response)
+        try:
+            initial_payload: Any = response.json()
+        except ValueError:
+            initial_payload = response.text
+        logger.info("WB API /orders/new JSON[0:500]=%s", _payload_preview(initial_payload))
         if response.status_code == 429:
             logger.warning("WB API вернул 429, ожидание перед повтором /orders/new")
             await asyncio.sleep(2.0)
             response = await client.get(WB_NEW_ORDERS_URL, headers=headers)
             _log_marketplace_response("WB", response)
+            try:
+                initial_payload = response.json()
+            except ValueError:
+                initial_payload = response.text
+            logger.info("WB API /orders/new (retry) JSON[0:500]=%s", _payload_preview(initial_payload))
         response.raise_for_status()
 
-        for item in _extract_wb_orders(response.json()):
+        for item in _extract_wb_orders(initial_payload):
             normalized = _normalize_wb_order(item)
             if normalized:
                 snapshots.append(normalized)
@@ -633,13 +656,17 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
 
             response = await client.get(WB_ORDERS_URL, headers=headers, params=params)
             _log_marketplace_response("WB", response)
+            try:
+                payload: Any = response.json()
+            except ValueError:
+                payload = response.text
+            logger.info("WB API /orders JSON[next=%s][0:500]=%s", next_cursor, _payload_preview(payload))
             if response.status_code == 429:
                 logger.warning("WB API вернул 429, ожидание перед повтором страницы")
                 await asyncio.sleep(2.0)
                 continue
             response.raise_for_status()
 
-            payload = response.json()
             orders_payload = _extract_wb_orders(payload)
             if not orders_payload:
                 break

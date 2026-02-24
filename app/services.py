@@ -802,8 +802,8 @@ def _merge_wb_statuses_into_orders(
         if not status_payload:
             continue
 
-        supplier_status = status_payload.get("supplierStatus")
-        wb_status = status_payload.get("wbStatus")
+        supplier_status = _extract_wb_supplier_status(status_payload)
+        wb_status = _extract_wb_status(status_payload)
         if supplier_status is not None:
             order["supplierStatus"] = supplier_status
         if wb_status is not None:

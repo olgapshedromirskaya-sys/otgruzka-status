@@ -629,62 +629,70 @@ async def _fetch_wb_statuses_by_order_id(
         return {}
 
     statuses_by_order_id: dict[int, dict[str, Any]] = {}
-    for batch_start in range(0, len(unique_order_ids), WB_STATUS_BATCH_SIZE):
-        batch_ids = unique_order_ids[batch_start : batch_start + WB_STATUS_BATCH_SIZE]
-        batch_orders = [{"id": int(order_id)} for order_id in batch_ids]
-        batch_payload = {"orders": batch_orders}
-        request_headers = {
-            **headers,
-            "Content-Type": "application/json",
-        }
-        logger.info(
-            "WB API /orders/status отправка batch=%s size=%s первые 3 orders=%s",
-            (batch_start // WB_STATUS_BATCH_SIZE) + 1,
-            len(batch_orders),
-            batch_orders[:3],
-        )
-        if batch_start == 0:
+    try:
+        for batch_start in range(0, len(unique_order_ids), WB_STATUS_BATCH_SIZE):
+            batch_ids = unique_order_ids[batch_start : batch_start + WB_STATUS_BATCH_SIZE]
+            batch_orders = [{"id": int(order_id)} for order_id in batch_ids]
+            batch_payload = {"orders": batch_orders}
+            request_headers = {
+                **headers,
+                "Content-Type": "application/json",
+            }
             logger.info(
-                "WB API /orders/status request body batch=1: %s",
-                json.dumps(batch_payload, ensure_ascii=False),
+                "WB API /orders/status отправка batch=%s size=%s первые 3 orders=%s",
+                (batch_start // WB_STATUS_BATCH_SIZE) + 1,
+                len(batch_orders),
+                batch_orders[:3],
             )
-        response = await client.post(WB_ORDERS_STATUS_URL, headers=request_headers, json=batch_payload)
-        _log_marketplace_response("WB", response)
-        try:
-            payload: Any = response.json()
-        except ValueError:
-            payload = response.text
-        logger.info(
-            "WB API /orders/status JSON[batch=%s size=%s][0:500]=%s",
-            (batch_start // WB_STATUS_BATCH_SIZE) + 1,
-            len(batch_ids),
-            _payload_preview(payload),
-        )
-        if response.status_code == 429:
-            logger.warning("WB API вернул 429, ожидание перед повтором /orders/status")
-            await asyncio.sleep(2.0)
+            if batch_start == 0:
+                logger.info(
+                    "WB API /orders/status request body batch=1: %s",
+                    json.dumps(batch_payload, ensure_ascii=False),
+                )
             response = await client.post(WB_ORDERS_STATUS_URL, headers=request_headers, json=batch_payload)
             _log_marketplace_response("WB", response)
             try:
-                payload = response.json()
+                payload: Any = response.json()
             except ValueError:
                 payload = response.text
             logger.info(
-                "WB API /orders/status (retry) JSON[batch=%s size=%s][0:500]=%s",
+                "WB API /orders/status JSON[batch=%s size=%s][0:500]=%s",
                 (batch_start // WB_STATUS_BATCH_SIZE) + 1,
                 len(batch_ids),
                 _payload_preview(payload),
             )
-        response.raise_for_status()
+            if response.status_code == 429:
+                logger.warning("WB API вернул 429, ожидание перед повтором /orders/status")
+                await asyncio.sleep(2.0)
+                response = await client.post(WB_ORDERS_STATUS_URL, headers=request_headers, json=batch_payload)
+                _log_marketplace_response("WB", response)
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = response.text
+                logger.info(
+                    "WB API /orders/status (retry) JSON[batch=%s size=%s][0:500]=%s",
+                    (batch_start // WB_STATUS_BATCH_SIZE) + 1,
+                    len(batch_ids),
+                    _payload_preview(payload),
+                )
+            response.raise_for_status()
 
-        for status_item in _extract_wb_order_statuses(payload):
-            status_order_id = _extract_wb_order_id(status_item)
-            if status_order_id is None:
-                continue
-            statuses_by_order_id[status_order_id] = status_item
+            for status_item in _extract_wb_order_statuses(payload):
+                status_order_id = _extract_wb_order_id(status_item)
+                if status_order_id is None:
+                    continue
+                statuses_by_order_id[status_order_id] = status_item
 
-        if batch_start + WB_STATUS_BATCH_SIZE < len(unique_order_ids):
-            await asyncio.sleep(REQUEST_PAUSE_SECONDS)
+            if batch_start + WB_STATUS_BATCH_SIZE < len(unique_order_ids):
+                await asyncio.sleep(REQUEST_PAUSE_SECONDS)
+    except Exception:
+        logger.warning(
+            "WB API /orders/status не удалось получить статусы, продолжаем без них (orders=%s)",
+            len(unique_order_ids),
+            exc_info=True,
+        )
+        return {}
 
     return statuses_by_order_id
 

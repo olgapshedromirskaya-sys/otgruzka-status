@@ -33,7 +33,7 @@ MAX_OZON_PAGES = 30
 
 WB_NEW_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders/new"
 WB_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders"
-OZON_FBS_LIST_URL = "https://api-seller.ozon.ru/v1/posting/fbs/list"
+OZON_FBS_LIST_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
 
 
 def get_user_by_telegram_id(session: Session, telegram_id: int) -> User | None:

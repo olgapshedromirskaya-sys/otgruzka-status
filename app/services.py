@@ -31,8 +31,9 @@ REQUEST_PAUSE_SECONDS = 0.45
 MAX_WB_PAGES = 20
 MAX_OZON_PAGES = 30
 
-WB_ORDERS_URL = "https://api.wildberries.ru/api/v3/orders"
-OZON_FBS_LIST_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
+WB_NEW_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders/new"
+WB_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders"
+OZON_FBS_LIST_URL = "https://api-seller.ozon.ru/v1/posting/fbs/list"
 
 
 def get_user_by_telegram_id(session: Session, telegram_id: int) -> User | None:
@@ -219,6 +220,35 @@ def _safe_int(value: Any, default: int = 1) -> int:
         return parsed if parsed > 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def _log_marketplace_response(api_name: str, response: httpx.Response) -> None:
+    request_url = str(response.request.url)
+    logger.info("%s API ответ: url=%s status=%s", api_name, request_url, response.status_code)
+    if response.is_error:
+        body_preview = response.text[:200].replace("\n", "\\n")
+        logger.error(
+            "%s API ошибка: url=%s status=%s body[0:200]=%s",
+            api_name,
+            request_url,
+            response.status_code,
+            body_preview,
+        )
+
+
+def _extract_wb_orders(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    orders_payload = payload.get("orders") or payload.get("data") or []
+    if isinstance(orders_payload, dict):
+        orders_payload = orders_payload.get("orders", [])
+    if not isinstance(orders_payload, list):
+        return []
+
+    return [item for item in orders_payload if isinstance(item, dict)]
 
 
 def _normalize_status_text(raw_status: str | int | None) -> str:
@@ -581,16 +611,28 @@ def _normalize_ozon_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
 async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
     headers = {"Authorization": wb_token.strip()}
     snapshots: list[ExternalOrderSnapshot] = []
-    next_cursor: int | str | None = 0
-    now = datetime.now(timezone.utc)
+    next_cursor: int | str = 0
 
     async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(WB_NEW_ORDERS_URL, headers=headers)
+        _log_marketplace_response("WB", response)
+        if response.status_code == 429:
+            logger.warning("WB API вернул 429, ожидание перед повтором /orders/new")
+            await asyncio.sleep(2.0)
+            response = await client.get(WB_NEW_ORDERS_URL, headers=headers)
+            _log_marketplace_response("WB", response)
+        response.raise_for_status()
+
+        for item in _extract_wb_orders(response.json()):
+            normalized = _normalize_wb_order(item)
+            if normalized:
+                snapshots.append(normalized)
+
         for _ in range(MAX_WB_PAGES):
-            params: dict[str, Any] = {"limit": 1000, "dateFrom": (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")}
-            if next_cursor:
-                params["next"] = next_cursor
+            params: dict[str, Any] = {"limit": 1000, "next": next_cursor}
 
             response = await client.get(WB_ORDERS_URL, headers=headers, params=params)
+            _log_marketplace_response("WB", response)
             if response.status_code == 429:
                 logger.warning("WB API вернул 429, ожидание перед повтором страницы")
                 await asyncio.sleep(2.0)
@@ -598,20 +640,17 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
             response.raise_for_status()
 
             payload = response.json()
-            orders_payload = payload.get("orders") or payload.get("data") or []
-            if isinstance(orders_payload, dict):
-                orders_payload = orders_payload.get("orders", [])
-            if not isinstance(orders_payload, list):
+            orders_payload = _extract_wb_orders(payload)
+            if not orders_payload:
                 break
 
             for item in orders_payload:
-                if isinstance(item, dict):
-                    normalized = _normalize_wb_order(item)
-                    if normalized:
-                        snapshots.append(normalized)
+                normalized = _normalize_wb_order(item)
+                if normalized:
+                    snapshots.append(normalized)
 
-            new_next = payload.get("next")
-            if not orders_payload or new_next in (None, "", 0) or new_next == next_cursor:
+            new_next = payload.get("next") if isinstance(payload, dict) else None
+            if new_next in (None, "", 0) or new_next == next_cursor:
                 break
             next_cursor = new_next
             await asyncio.sleep(REQUEST_PAUSE_SECONDS)
@@ -627,28 +666,22 @@ async def _fetch_ozon_orders(ozon_client_id: str, ozon_api_key: str) -> list[Ext
     snapshots: list[ExternalOrderSnapshot] = []
     offset = 0
     limit = 1000
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=30)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         for _ in range(MAX_OZON_PAGES):
             body = {
-                "dir": "DESC",
-                "filter": {
-                    "since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                },
+                "dir": "ASC",
+                "filter": {"status": ""},
                 "limit": limit,
                 "offset": offset,
                 "with": {
                     "analytics_data": False,
-                    "barcodes": False,
                     "financial_data": False,
-                    "translit": True,
                 },
             }
 
             response = await client.post(OZON_FBS_LIST_URL, headers=headers, json=body)
+            _log_marketplace_response("Ozon", response)
             if response.status_code == 429:
                 logger.warning("Ozon API вернул 429, ожидание перед повтором страницы")
                 await asyncio.sleep(2.0)

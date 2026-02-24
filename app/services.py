@@ -277,7 +277,8 @@ def _map_wb_status(
     wb_status = _normalize_status_text(raw_wb_status)
 
     status = WB_SUPPLIER_STATUS_MAP.get(supplier_status, OrderStatus.NEW)
-    if supplier_status in {"confirm", "complete"} and wb_status in WB_STATUS_MAP:
+    # wbStatus из WB API более детальный, поэтому при его наличии приоритизируем его.
+    if wb_status in WB_STATUS_MAP:
         status = WB_STATUS_MAP[wb_status]
 
     if supplier_status == "confirm" and has_supply_id:
@@ -547,22 +548,48 @@ def _extract_wb_task_number(item: dict[str, Any]) -> str:
     ).strip()
 
 
+def _extract_wb_supplier_status(item: dict[str, Any]) -> Any:
+    return item.get("supplierStatus", item.get("supplier_status"))
+
+
+def _extract_wb_status(item: dict[str, Any]) -> Any:
+    return item.get("wbStatus", item.get("wb_status"))
+
+
+def _append_wb_status_preview_items(
+    source: list[dict[str, Any]],
+    preview_items: list[dict[str, Any]],
+    limit: int = 5,
+) -> None:
+    if len(preview_items) >= limit:
+        return
+    missing = limit - len(preview_items)
+    preview_items.extend(source[:missing])
+
+
+def _log_wb_status_preview(items: list[dict[str, Any]], limit: int = 5) -> None:
+    preview: list[dict[str, Any]] = []
+    for item in items[:limit]:
+        preview.append(
+            {
+                "id": _extract_wb_task_number(item),
+                "supplierStatus": _extract_wb_supplier_status(item),
+                "wbStatus": _extract_wb_status(item),
+            }
+        )
+    if preview:
+        logger.info("WB API первые %s заказов supplierStatus/wbStatus: %s", len(preview), preview)
+
+
 def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
     task_number = _extract_wb_task_number(item)
     if not task_number:
         return None
 
-    raw_supplier_status = item.get("supplierStatus")
-    raw_wb_status = item.get("wbStatus", item.get("wb_status"))
+    raw_supplier_status = _extract_wb_supplier_status(item)
+    raw_wb_status = _extract_wb_status(item)
     raw_supply_id = item.get("supplyId", item.get("supply_id"))
     has_supply_id = _has_wb_supply_id(raw_supply_id)
-    logger.info(
-        "WB status source: order=%s supplierStatus=%r wbStatus=%r supplyId=%r",
-        task_number,
-        raw_supplier_status,
-        raw_wb_status,
-        raw_supply_id,
-    )
     status = _map_wb_status(raw_supplier_status, raw_wb_status, has_supply_id=has_supply_id)
     status_at = _parse_datetime(
         item.get("updatedAt")
@@ -651,6 +678,7 @@ def _normalize_ozon_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
 async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
     headers = {"Authorization": wb_token.strip()}
     snapshots: list[ExternalOrderSnapshot] = []
+    status_preview_items: list[dict[str, Any]] = []
     recent_from, _ = _recent_period_utc()
     next_cursor: int | str = 0
 
@@ -680,7 +708,9 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
             logger.info("WB API /orders/new (retry) JSON[0:500]=%s", _payload_preview(initial_payload))
         response.raise_for_status()
 
-        for item in _extract_wb_orders(initial_payload):
+        initial_orders_payload = _extract_wb_orders(initial_payload)
+        _append_wb_status_preview_items(initial_orders_payload, status_preview_items)
+        for item in initial_orders_payload:
             normalized = _normalize_wb_order(item)
             if not normalized:
                 continue
@@ -718,6 +748,7 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
             orders_payload = _extract_wb_orders(payload)
             if not orders_payload:
                 break
+            _append_wb_status_preview_items(orders_payload, status_preview_items)
 
             for item in orders_payload:
                 normalized = _normalize_wb_order(item)
@@ -739,6 +770,7 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
                 break
             next_cursor = new_next
             await asyncio.sleep(REQUEST_PAUSE_SECONDS)
+    _log_wb_status_preview(status_preview_items)
     return snapshots
 
 
@@ -866,16 +898,11 @@ def _upsert_snapshot(session: Session, snapshot: ExternalOrderSnapshot) -> tuple
         event_created = True
         return created, event_created
 
-    order.product_name = snapshot.product_name or order.product_name
-    if snapshot.sku:
-        order.sku = snapshot.sku
-    order.quantity = max(snapshot.quantity, 1)
-    order.due_ship_at = snapshot.due_ship_at or order.due_ship_at
-
+    old_status = order.current_status
     next_status = snapshot.status
     rollback_blocked = False
     if snapshot.marketplace == Marketplace.WB:
-        protected_status = _prevent_wb_status_rollback(order.current_status, snapshot.status)
+        protected_status = _prevent_wb_status_rollback(old_status, snapshot.status)
         rollback_blocked = protected_status != snapshot.status
         next_status = protected_status
         if rollback_blocked:
@@ -886,27 +913,27 @@ def _upsert_snapshot(session: Session, snapshot: ExternalOrderSnapshot) -> tuple
                 snapshot.status.value,
             )
 
-    should_create_event = False
-    if not rollback_blocked:
-        if order.current_status != next_status:
-            should_create_event = True
-        elif snapshot.status_at > _to_aware_utc(order.current_status_at) + timedelta(seconds=1):
-            should_create_event = True
+    status_changed = not rollback_blocked and next_status != old_status
+    if status_changed:
+        order.product_name = snapshot.product_name or order.product_name
+        if snapshot.sku:
+            order.sku = snapshot.sku
+        order.quantity = max(snapshot.quantity, 1)
+        order.due_ship_at = snapshot.due_ship_at or order.due_ship_at
 
-    if should_create_event and not _is_duplicate_event(order, next_status, snapshot.status_at):
-        order.events.append(
-            OrderEvent(
-                status=next_status,
-                event_at=snapshot.status_at,
-                note=_event_note(snapshot.source_status),
+        if not _is_duplicate_event(order, next_status, snapshot.status_at):
+            order.events.append(
+                OrderEvent(
+                    status=next_status,
+                    event_at=snapshot.status_at,
+                    note=_event_note(snapshot.source_status),
+                )
             )
-        )
+            event_created = True
+
         order.current_status = next_status
         order.current_status_at = snapshot.status_at
         order.updated_at = datetime.now(timezone.utc)
-        event_created = True
-    elif not rollback_blocked and snapshot.status_at > _to_aware_utc(order.current_status_at):
-        order.current_status_at = snapshot.status_at
 
     session.add(order)
     return created, event_created

@@ -631,7 +631,14 @@ async def _fetch_wb_statuses_by_order_id(
     statuses_by_order_id: dict[int, dict[str, Any]] = {}
     for batch_start in range(0, len(unique_order_ids), WB_STATUS_BATCH_SIZE):
         batch_ids = unique_order_ids[batch_start : batch_start + WB_STATUS_BATCH_SIZE]
-        batch_payload = {"orders": [{"id": order_id} for order_id in batch_ids]}
+        batch_orders = [{"id": int(order_id)} for order_id in batch_ids]
+        batch_payload = {"orders": batch_orders}
+        logger.info(
+            "WB API /orders/status отправка batch=%s size=%s первые 3 orders=%s",
+            (batch_start // WB_STATUS_BATCH_SIZE) + 1,
+            len(batch_orders),
+            batch_orders[:3],
+        )
         response = await client.post(WB_ORDERS_STATUS_URL, headers=headers, json=batch_payload)
         _log_marketplace_response("WB", response)
         try:

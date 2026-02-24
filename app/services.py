@@ -578,13 +578,11 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
     headers = {"Authorization": wb_token.strip()}
     snapshots: list[ExternalOrderSnapshot] = []
     recent_from, _ = _recent_period_utc()
-    date_from_unix = int(recent_from.timestamp())
-    next_cursor: int | str | None = None
+    next_cursor: int | str = 0
 
     logger.info(
-        "WB синхронизация за последние %s дней: dateFrom=%s (%s)",
+        "WB синхронизация за последние %s дней: createdAt >= %s",
         RECENT_ORDERS_DAYS,
-        date_from_unix,
         _to_iso8601_utc(recent_from),
     )
 
@@ -610,20 +608,21 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
 
         for item in _extract_wb_orders(initial_payload):
             normalized = _normalize_wb_order(item)
-            if normalized and normalized.status_at >= recent_from:
-                snapshots.append(normalized)
-            elif normalized:
+            if not normalized:
+                continue
+            created_at = _parse_datetime(item.get("createdAt"), fallback=normalized.status_at)
+            if created_at < recent_from:
                 logger.info(
-                    "WB заказ пропущен (старше %s дней): id=%s status_at=%s",
+                    "WB заказ пропущен (createdAt старше %s дней): id=%s createdAt=%s",
                     RECENT_ORDERS_DAYS,
                     normalized.assembly_task_number,
-                    _to_iso8601_utc(normalized.status_at),
+                    _to_iso8601_utc(created_at),
                 )
+                continue
+            snapshots.append(normalized)
 
         for _ in range(MAX_WB_PAGES):
-            params: dict[str, Any] = {"dateFrom": date_from_unix, "limit": 1000}
-            if next_cursor not in (None, "", 0):
-                params["next"] = next_cursor
+            params: dict[str, Any] = {"limit": 1000, "next": next_cursor}
 
             response = await client.get(WB_ORDERS_URL, headers=headers, params=params)
             _log_marketplace_response("WB", response)
@@ -632,8 +631,7 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
             except ValueError:
                 payload = response.text
             logger.info(
-                "WB API /orders JSON[dateFrom=%s,next=%s][0:500]=%s",
-                date_from_unix,
+                "WB API /orders JSON[next=%s][0:500]=%s",
                 next_cursor,
                 _payload_preview(payload),
             )
@@ -649,15 +647,18 @@ async def _fetch_wb_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
 
             for item in orders_payload:
                 normalized = _normalize_wb_order(item)
-                if normalized and normalized.status_at >= recent_from:
-                    snapshots.append(normalized)
-                elif normalized:
+                if not normalized:
+                    continue
+                created_at = _parse_datetime(item.get("createdAt"), fallback=normalized.status_at)
+                if created_at < recent_from:
                     logger.info(
-                        "WB заказ пропущен (старше %s дней): id=%s status_at=%s",
+                        "WB заказ пропущен (createdAt старше %s дней): id=%s createdAt=%s",
                         RECENT_ORDERS_DAYS,
                         normalized.assembly_task_number,
-                        _to_iso8601_utc(normalized.status_at),
+                        _to_iso8601_utc(created_at),
                     )
+                    continue
+                snapshots.append(normalized)
 
             new_next = payload.get("next") if isinstance(payload, dict) else None
             if new_next in (None, "", 0) or new_next == next_cursor:

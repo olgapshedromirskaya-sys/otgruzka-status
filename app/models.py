@@ -14,11 +14,20 @@ class Order(Base):
         Index("ix_orders_marketplace", "marketplace"),
         Index("ix_orders_current_status", "current_status"),
         Index("ix_orders_external_order_id", "external_order_id"),
+        Index("ix_orders_wb_rid", "wb_rid"),  # для быстрого поиска при обновлении из Statistics API
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     marketplace: Mapped[Marketplace] = mapped_column(SAEnum(Marketplace), nullable=False)
+
+    # Для WB: числовой id заказа из /api/v3/orders (= номер сборочного задания на WB)
+    # Для Ozon: posting_number
     external_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # Только для WB: поле 'rid' из /api/v3/orders = поле 'srid' из Statistics API
+    # Используется для связки активных заказов с финальными статусами из Statistics API
+    wb_rid: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+
     product_name: Mapped[str] = mapped_column(String(256), nullable=False)
     sku: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     quantity: Mapped[int] = mapped_column(default=1, nullable=False)
@@ -35,7 +44,6 @@ class Order(Base):
         onupdate=func.now(),
         nullable=False,
     )
-
     events: Mapped[list["OrderEvent"]] = relationship(
         "OrderEvent",
         back_populates="order",
@@ -59,7 +67,6 @@ class OrderEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-
     order: Mapped[Order] = relationship("Order", back_populates="events")
 
 
@@ -94,4 +101,3 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     added_by: Mapped[int] = mapped_column(nullable=False)
-

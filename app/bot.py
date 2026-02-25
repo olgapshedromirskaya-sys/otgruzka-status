@@ -327,7 +327,12 @@ async def add_employee_waiting_role_message_handler(message: Message) -> None:
     )
 
 
-@router.callback_query(AddEmployeeStates.waiting_role, F.data == ADD_EMPLOYEE_ROLE_ADMIN)
+# ИСПРАВЛЕНИЕ: убрана проверка состояния AddEmployeeStates.waiting_role из декоратора.
+# MemoryStorage сбрасывается при каждом рестарте сервиса на Render,
+# поэтому состояние FSM пропадает пока пользователь думает перед нажатием кнопки.
+# Теперь обработчик срабатывает всегда по callback_data, а данные проверяются внутри.
+# Также удалён add_employee_role_stale_callback_handler — он перехватывал нажатие.
+@router.callback_query(F.data == ADD_EMPLOYEE_ROLE_ADMIN)
 async def add_employee_select_role_handler(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.from_user:
         await callback.answer("Не удалось определить Telegram ID пользователя.", show_alert=True)
@@ -348,9 +353,14 @@ async def add_employee_select_role_handler(callback: CallbackQuery, state: FSMCo
     data = await state.get_data()
     telegram_id = data.get("telegram_id")
     full_name = str(data.get("full_name", "")).strip()
+
+    # Если состояние сброшено (бот перезапустился) — просим начать заново
     if not isinstance(telegram_id, int) or telegram_id <= 0 or not full_name:
         if callback.message:
-            await callback.message.answer("Диалог добавления сотрудника сброшен. Нажмите «👥 Добавить сотрудника» снова.")
+            await callback.message.answer(
+                "⚠️ Сессия добавления сотрудника истекла (бот перезапускался).\n"
+                "Нажмите «👥 Добавить сотрудника» и начните заново."
+            )
         await callback.answer()
         await state.clear()
         return
@@ -378,14 +388,6 @@ async def add_employee_select_role_handler(callback: CallbackQuery, state: FSMCo
 
     await callback.answer()
     await state.clear()
-
-
-@router.callback_query(F.data == ADD_EMPLOYEE_ROLE_ADMIN)
-async def add_employee_role_stale_callback_handler(callback: CallbackQuery) -> None:
-    await callback.answer(
-        "Диалог добавления сотрудника уже завершён. Нажмите «👥 Добавить сотрудника» для нового добавления.",
-        show_alert=True,
-    )
 
 
 @router.message(F.text == "👥 Сотрудники")

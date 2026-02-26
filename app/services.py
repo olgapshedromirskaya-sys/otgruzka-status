@@ -895,7 +895,13 @@ def _is_duplicate_event(order: Order, status: OrderStatus, event_at: datetime) -
     return False
 
 
+def _looks_like_srid(value: str) -> bool:
+    """srid содержит буквы или точки — это не числовой id WB"""
+    return any(c.isalpha() or c == '.' for c in value)
+
+
 def _upsert_snapshot(session: Session, snapshot: ExternalOrderSnapshot) -> tuple[bool, bool]:
+    # Сначала ищем по external_order_id
     query = (
         select(Order)
         .where(
@@ -906,6 +912,26 @@ def _upsert_snapshot(session: Session, snapshot: ExternalOrderSnapshot) -> tuple
         .order_by(Order.id.desc())
     )
     order = session.scalar(query)
+
+    # Если не нашли по external_order_id, и номер выглядит как srid,
+    # ищем по wb_rid (srid из Statistics == rid из /api/v3/orders == wb_rid в БД)
+    if not order and snapshot.wb_rid and _looks_like_srid(snapshot.assembly_task_number):
+        order = session.scalar(
+            select(Order)
+            .where(
+                Order.marketplace == snapshot.marketplace,
+                Order.wb_rid == snapshot.wb_rid,
+            )
+            .options(selectinload(Order.events))
+            .order_by(Order.id.desc())
+        )
+        if order:
+            # Обновляем assembly_task_number на числовой id из БД
+            logger.debug(
+                "WB Statistics: найден заказ по wb_rid=%s → id=%s",
+                snapshot.wb_rid, order.external_order_id,
+            )
+
     created = False
     event_created = False
 

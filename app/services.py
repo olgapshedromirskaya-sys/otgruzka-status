@@ -219,6 +219,23 @@ def _normalize_status_text(raw_status: str | int | None) -> str:
     return str(raw_status).strip().lower()
 
 
+def _extract_wb_task_number(raw_value: Any) -> str | None:
+    """
+    Номер сборочного задания WB должен быть 10-значным числом.
+    """
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    if text.isdigit() and len(text) == 10:
+        return text
+    digits_only = "".join(ch for ch in text if ch.isdigit())
+    if len(digits_only) == 10:
+        return digits_only
+    return None
+
+
 def _recent_period_utc(days: int = RECENT_ORDERS_DAYS) -> tuple[datetime, datetime]:
     now = datetime.now(timezone.utc)
     return now - timedelta(days=days), now
@@ -502,9 +519,7 @@ def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
     assembly_task_number = числовой 'id' WB (номер сборочного задания)
     wb_rid               = 'rid' (для связки со Statistics API)
     """
-    task_number = str(item.get("id") or "").strip()
-    if not task_number:
-        task_number = str(item.get("rid") or item.get("srid") or "").strip()
+    task_number = _extract_wb_task_number(item.get("id"))
     if not task_number:
         return None
 
@@ -530,7 +545,7 @@ def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
 
     return ExternalOrderSnapshot(
         marketplace=Marketplace.WB,
-        assembly_task_number=task_number[:128],
+        assembly_task_number=task_number,
         status=status,
         status_at=status_at,
         product_name=product_name[:256],
@@ -713,9 +728,9 @@ def _merge_wb_snapshots(
         if stat.wb_rid and stat.wb_rid in rid_to_task:
             stat = dataclasses.replace(stat, assembly_task_number=rid_to_task[stat.wb_rid])
             matched += 1
-        else:
-            unmatched += 1
-        merged.append(stat)
+            merged.append(stat)
+            continue
+        unmatched += 1
 
     logger.info(
         "WB мёрж: активных=%s statistics=%s (matched=%s unmatched=%s) итого=%s",

@@ -36,6 +36,7 @@ RECENT_ORDERS_DAYS = 30
 
 WB_NEW_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders/new"
 WB_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders"
+WB_SUPPLY_URL = "https://marketplace-api.wildberries.ru/api/v3/supplies/{supply_id}"
 WB_STATISTICS_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
 OZON_FBS_LIST_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
 
@@ -99,8 +100,6 @@ def ensure_owner_user(session: Session) -> bool:
 @dataclass(slots=True)
 class ExternalOrderSnapshot:
     marketplace: Marketplace
-    # Для WB: числовой id из /api/v3/orders (= номер сборочного задания)
-    # Для Ozon: posting_number
     assembly_task_number: str
     status: OrderStatus
     status_at: datetime
@@ -109,10 +108,15 @@ class ExternalOrderSnapshot:
     quantity: int
     due_ship_at: datetime | None
     source_status: str
-    # Только WB: rid из /api/v3/orders = srid из Statistics API
     wb_rid: str | None = field(default=None)
 
 
+# ─── WB статусная воронка ────────────────────────────────────────────────────
+#
+#  NEW → ASSEMBLY → TRANSFERRED_TO_DELIVERY → ACCEPTED_AT_WAREHOUSE
+#      → IN_TRANSIT_TO_BUYER → ARRIVED_AT_BUYER_PICKUP → BUYOUT
+#  Любой шаг может перейти в REJECTION
+#
 WB_FORWARD_FUNNEL: tuple[OrderStatus, ...] = (
     OrderStatus.NEW,
     OrderStatus.ASSEMBLY,
@@ -219,23 +223,6 @@ def _normalize_status_text(raw_status: str | int | None) -> str:
     return str(raw_status).strip().lower()
 
 
-def _extract_wb_task_number(raw_value: Any) -> str | None:
-    """
-    Номер сборочного задания WB должен быть 10-значным числом.
-    """
-    if raw_value is None:
-        return None
-    text = str(raw_value).strip()
-    if not text:
-        return None
-    if text.isdigit() and len(text) == 10:
-        return text
-    digits_only = "".join(ch for ch in text if ch.isdigit())
-    if len(digits_only) == 10:
-        return digits_only
-    return None
-
-
 def _recent_period_utc(days: int = RECENT_ORDERS_DAYS) -> tuple[datetime, datetime]:
     now = datetime.now(timezone.utc)
     return now - timedelta(days=days), now
@@ -255,14 +242,18 @@ def _has_wb_supply_id(raw_supply_id: Any) -> bool:
     return bool(raw_supply_id)
 
 
-def _map_wb_status_by_supply(raw_supply_id: Any) -> OrderStatus:
+def _map_wb_status(raw_supply_id: Any, supply_done: bool) -> OrderStatus:
     """
-    supplyId пустой   → NEW      (заказ не добавлен в поставку)
-    supplyId заполнен → ASSEMBLY (добавлен в поставку, но не сдан)
+    Определяет статус WB заказа:
+      supplyId пустой              → NEW
+      supplyId заполнен, done=False → ASSEMBLY      (в поставке, не сдана)
+      supplyId заполнен, done=True  → TRANSFERRED_TO_DELIVERY (поставка сдана на склад WB)
     """
-    if _has_wb_supply_id(raw_supply_id):
-        return OrderStatus.ASSEMBLY
-    return OrderStatus.NEW
+    if not _has_wb_supply_id(raw_supply_id):
+        return OrderStatus.NEW
+    if supply_done:
+        return OrderStatus.TRANSFERRED_TO_DELIVERY
+    return OrderStatus.ASSEMBLY
 
 
 def _map_wb_statistics_status(item: dict[str, Any]) -> OrderStatus:
@@ -514,18 +505,74 @@ def _log_ozon_postings_preview(postings: list[dict[str, Any]]) -> None:
     logger.info("Ozon API первые 3 заказа: %s", preview)
 
 
-def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
+async def _fetch_wb_supply_statuses(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    supply_ids: set[str],
+) -> dict[str, bool]:
     """
-    assembly_task_number = числовой 'id' WB (номер сборочного задания)
+    Запрашивает статус поставок по их ID.
+    Возвращает словарь {supply_id: done} где done=True означает что поставка сдана.
+    Запросы выполняются параллельно с ограничением.
+    """
+    if not supply_ids:
+        return {}
+
+    result: dict[str, bool] = {}
+    supply_list = list(supply_ids)
+    logger.info("WB: запрашиваем статусы %s поставок", len(supply_list))
+
+    # Запрашиваем по 5 поставок параллельно
+    batch_size = 5
+    for i in range(0, len(supply_list), batch_size):
+        batch = supply_list[i:i + batch_size]
+        tasks = []
+        for supply_id in batch:
+            url = WB_SUPPLY_URL.format(supply_id=supply_id)
+            tasks.append(client.get(url, headers=headers))
+
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        for supply_id, response in zip(batch, responses):
+            if isinstance(response, Exception):
+                logger.warning("Ошибка запроса поставки %s: %s", supply_id, response)
+                result[supply_id] = False
+                continue
+            try:
+                if response.status_code == 200:
+                    data = response.json()
+                    result[supply_id] = bool(data.get("done", False))
+                    logger.debug("Поставка %s: done=%s", supply_id, result[supply_id])
+                else:
+                    logger.warning("Поставка %s: статус %s", supply_id, response.status_code)
+                    result[supply_id] = False
+            except Exception as e:
+                logger.warning("Ошибка парсинга поставки %s: %s", supply_id, e)
+                result[supply_id] = False
+
+        if i + batch_size < len(supply_list):
+            await asyncio.sleep(REQUEST_PAUSE_SECONDS)
+
+    done_count = sum(1 for v in result.values() if v)
+    logger.info("WB поставки: всего=%s сданных(done=True)=%s", len(result), done_count)
+    return result
+
+
+def _normalize_wb_order(item: dict[str, Any], supply_done: bool = False) -> ExternalOrderSnapshot | None:
+    """
+    assembly_task_number = числовой 'id' (номер сборочного задания)
     wb_rid               = 'rid' (для связки со Statistics API)
+    supply_done          = True если поставка уже сдана на склад WB
     """
-    task_number = _extract_wb_task_number(item.get("id"))
+    task_number = str(item.get("id") or "").strip()
+    if not task_number:
+        task_number = str(item.get("rid") or item.get("srid") or "").strip()
     if not task_number:
         return None
 
     wb_rid = str(item.get("rid") or item.get("srid") or "").strip() or None
     raw_supply_id = item.get("supplyId", item.get("supply_id"))
-    status = _map_wb_status_by_supply(raw_supply_id)
+    status = _map_wb_status(raw_supply_id, supply_done)
+
     status_at = _parse_datetime(item.get("updatedAt") or item.get("statusUpdatedAt") or item.get("createdAt"))
     due_ship_at = _parse_datetime(item.get("deadline") or item.get("shipmentDate"), fallback=status_at)
 
@@ -543,16 +590,20 @@ def _normalize_wb_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
         or f"Заказ WB {task_number}"
     )
 
+    supply_label = f"supplyId={raw_supply_id or ''}"
+    if raw_supply_id and supply_done:
+        supply_label += ",done=True"
+
     return ExternalOrderSnapshot(
         marketplace=Marketplace.WB,
-        assembly_task_number=task_number,
+        assembly_task_number=task_number[:128],
         status=status,
         status_at=status_at,
         product_name=product_name[:256],
         sku=sku[:128] if sku else None,
         quantity=_safe_int(item.get("quantity"), default=1),
         due_ship_at=due_ship_at,
-        source_status=f"supplyId={raw_supply_id or ''}",
+        source_status=supply_label,
         wb_rid=wb_rid[:256] if wb_rid else None,
     )
 
@@ -589,7 +640,12 @@ def _normalize_ozon_order(item: dict[str, Any]) -> ExternalOrderSnapshot | None:
 
 
 async def _fetch_wb_active_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
-    """Активные заказы из /api/v3/orders. Статус: NEW или ASSEMBLY."""
+    """
+    Получает активные заказы из /api/v3/orders.
+    Для заказов с supplyId дополнительно запрашивает статус поставки:
+      done=False → ASSEMBLY
+      done=True  → TRANSFERRED_TO_DELIVERY
+    """
     headers = {"Authorization": wb_token.strip()}
     snapshots: list[ExternalOrderSnapshot] = []
     all_wb_orders: list[dict[str, Any]] = []
@@ -597,6 +653,7 @@ async def _fetch_wb_active_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
     next_cursor: int | str = 0
 
     async with httpx.AsyncClient(timeout=30.0) as client:
+        # Новые заказы
         response = await client.get(WB_NEW_ORDERS_URL, headers=headers)
         _log_marketplace_response("WB", response)
         try:
@@ -613,6 +670,7 @@ async def _fetch_wb_active_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
         response.raise_for_status()
         all_wb_orders.extend(_extract_wb_orders(initial_payload))
 
+        # Все заказы с пагинацией
         for _ in range(MAX_WB_PAGES):
             params: dict[str, Any] = {"limit": 1000, "next": next_cursor}
             response = await client.get(WB_ORDERS_URL, headers=headers, params=params)
@@ -635,28 +693,56 @@ async def _fetch_wb_active_orders(wb_token: str) -> list[ExternalOrderSnapshot]:
             next_cursor = new_next
             await asyncio.sleep(REQUEST_PAUSE_SECONDS)
 
-        new_c = sum(1 for o in all_wb_orders if not _has_wb_supply_id(o.get("supplyId", o.get("supply_id"))))
-        logger.info("WB /api/v3/orders: NEW=%s ASSEMBLY=%s всего=%s", new_c, len(all_wb_orders) - new_c, len(all_wb_orders))
-
+        # Фильтруем по дате
+        recent_orders = []
         for item in all_wb_orders:
-            normalized = _normalize_wb_order(item)
+            created_at = _parse_datetime(item.get("createdAt"))
+            if created_at >= recent_from:
+                recent_orders.append(item)
+
+        logger.info("WB /api/v3/orders: всего=%s после фильтрации=%s", len(all_wb_orders), len(recent_orders))
+
+        # Собираем уникальные supplyId для заказов с поставкой
+        supply_ids: set[str] = set()
+        for item in recent_orders:
+            raw_supply_id = item.get("supplyId", item.get("supply_id"))
+            if _has_wb_supply_id(raw_supply_id):
+                supply_ids.add(str(raw_supply_id).strip())
+
+        # Запрашиваем статусы поставок
+        supply_statuses = await _fetch_wb_supply_statuses(client, headers, supply_ids)
+
+        # Нормализуем заказы с учётом статуса поставки
+        new_c = assembly_c = delivery_c = 0
+        for item in recent_orders:
+            raw_supply_id = item.get("supplyId", item.get("supply_id"))
+            supply_done = False
+            if _has_wb_supply_id(raw_supply_id):
+                supply_done = supply_statuses.get(str(raw_supply_id).strip(), False)
+
+            normalized = _normalize_wb_order(item, supply_done=supply_done)
             if not normalized:
                 continue
-            created_at = _parse_datetime(item.get("createdAt"), fallback=normalized.status_at)
-            if created_at < recent_from:
-                continue
+
+            if normalized.status == OrderStatus.NEW:
+                new_c += 1
+            elif normalized.status == OrderStatus.ASSEMBLY:
+                assembly_c += 1
+            else:
+                delivery_c += 1
+
             snapshots.append(normalized)
 
-    logger.info("WB /api/v3/orders: итого %s после фильтрации", len(snapshots))
+        logger.info(
+            "WB статусы: NEW=%s ASSEMBLY=%s TRANSFERRED_TO_DELIVERY=%s",
+            new_c, assembly_c, delivery_c,
+        )
+
     return snapshots
 
 
 async def _fetch_wb_statistics_snapshots(wb_token: str, recent_from: datetime) -> list[ExternalOrderSnapshot]:
-    """
-    Завершённые заказы из Statistics API (BUYOUT / REJECTION).
-    assembly_task_number = srid (временно), wb_rid = srid.
-    В _merge_wb_snapshots assembly_task_number заменяется на числовой id.
-    """
+    """Завершённые заказы из Statistics API (BUYOUT / REJECTION)."""
     headers = {"Authorization": wb_token.strip()}
     snapshots: list[ExternalOrderSnapshot] = []
     date_from = recent_from.strftime("%Y-%m-%d")
@@ -684,14 +770,15 @@ async def _fetch_wb_statistics_snapshots(wb_token: str, recent_from: datetime) -
                 status_at = _parse_datetime(item.get("lastChangeDate") or item.get("date"))
                 sku = str(item.get("supplierArticle") or item.get("nmId") or "").strip() or None
                 product_name = str(item.get("subject") or item.get("category") or "").strip() or f"Заказ WB {srid}"
-                source_label = "isCancel=True" if bool(item.get("isCancel")) else "isRealization=True"
+                is_cancel = bool(item.get("isCancel"))
+                source_label = "isCancel=True" if is_cancel else "isRealization=True"
                 if status == OrderStatus.BUYOUT:
                     buyout_c += 1
                 else:
                     rejection_c += 1
                 snapshots.append(ExternalOrderSnapshot(
                     marketplace=Marketplace.WB,
-                    assembly_task_number=srid[:128],  # временно, заменится в _merge
+                    assembly_task_number=srid[:128],
                     status=status,
                     status_at=status_at,
                     product_name=product_name[:256],
@@ -711,10 +798,7 @@ def _merge_wb_snapshots(
     active: list[ExternalOrderSnapshot],
     statistics: list[ExternalOrderSnapshot],
 ) -> list[ExternalOrderSnapshot]:
-    """
-    Заменяет assembly_task_number у Statistics-снимков на числовой id
-    через индекс wb_rid → assembly_task_number активных заказов.
-    """
+    """Связывает Statistics снимки с активными через wb_rid → assembly_task_number."""
     rid_to_task: dict[str, str] = {
         snap.wb_rid: snap.assembly_task_number
         for snap in active
@@ -728,9 +812,9 @@ def _merge_wb_snapshots(
         if stat.wb_rid and stat.wb_rid in rid_to_task:
             stat = dataclasses.replace(stat, assembly_task_number=rid_to_task[stat.wb_rid])
             matched += 1
-            merged.append(stat)
-            continue
-        unmatched += 1
+        else:
+            unmatched += 1
+        merged.append(stat)
 
     logger.info(
         "WB мёрж: активных=%s statistics=%s (matched=%s unmatched=%s) итого=%s",
@@ -858,7 +942,10 @@ def _upsert_snapshot(session: Session, snapshot: ExternalOrderSnapshot) -> tuple
         rollback_blocked = protected != snapshot.status
         next_status = protected
         if rollback_blocked:
-            logger.info("WB rollback prevented: order=%s %s→%s", order.external_order_id, old_status.value, snapshot.status.value)
+            logger.info(
+                "WB rollback prevented: order=%s %s→%s",
+                order.external_order_id, old_status.value, snapshot.status.value,
+            )
 
     if not rollback_blocked and next_status != old_status:
         order.product_name = snapshot.product_name or order.product_name

@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.auth import build_signed_init_data, extract_telegram_id_from_init_data
@@ -235,6 +236,34 @@ def settings_update_endpoint(
 @app.post("/api/sync/run", response_model=SyncReport)
 async def run_sync_endpoint() -> SyncReport:
     return await sync_orders_from_marketplaces()
+
+
+@app.post("/api/admin/cleanup-srid")
+def cleanup_srid_endpoint(session: Session = Depends(get_session)) -> dict:
+    """Удаляет WB заказы с srid-номерами (содержащими буквы или точки)."""
+    rows = session.execute(
+        text("SELECT id, external_order_id FROM orders WHERE marketplace='wb'")
+    ).fetchall()
+
+    srid_ids = [
+        row[0] for row in rows
+        if any(c.isalpha() for c in str(row[1])) or '.' in str(row[1])
+    ]
+
+    if not srid_ids:
+        return {"deleted_orders": 0, "deleted_events": 0, "message": "Нечего удалять"}
+
+    placeholders = ",".join(str(i) for i in srid_ids)
+    r1 = session.execute(text(f"DELETE FROM order_events WHERE order_id IN ({placeholders})"))
+    r2 = session.execute(text(f"DELETE FROM orders WHERE id IN ({placeholders})"))
+    session.commit()
+
+    logger.info("cleanup-srid: удалено заказов=%s событий=%s", r2.rowcount, r1.rowcount)
+    return {
+        "deleted_orders": r2.rowcount,
+        "deleted_events": r1.rowcount,
+        "message": "Готово",
+    }
 
 
 @app.get("/api/export/orders.csv")

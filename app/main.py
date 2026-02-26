@@ -266,6 +266,16 @@ def cleanup_srid_endpoint(session: Session = Depends(get_session)) -> dict:
     }
 
 
+
+@app.post("/api/admin/reset-wb")
+def reset_wb_endpoint(session: Session = Depends(get_session)) -> dict:
+    """Полная очистка всех WB заказов — для пересинхронизации с нуля."""
+    r1 = session.execute(text("DELETE FROM order_events WHERE order_id IN (SELECT id FROM orders WHERE marketplace='wb')"))
+    r2 = session.execute(text("DELETE FROM orders WHERE marketplace='wb'"))
+    session.commit()
+    logger.info("reset-wb: удалено заказов=%s событий=%s", r2.rowcount, r1.rowcount)
+    return {"deleted_orders": r2.rowcount, "deleted_events": r1.rowcount, "message": "WB заказы удалены"}
+
 @app.get("/api/export/orders.csv")
 def export_orders_csv_endpoint(
     session: Session = Depends(get_session),
